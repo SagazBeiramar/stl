@@ -358,19 +358,38 @@ $script:LastExchangeError = $null
 function Exchange-OWAToken([string]$refresh, [string]$client, [string]$scope) {
     $script:LastExchangeError = $null
     $body = "grant_type=refresh_token&refresh_token=$(UrlEnc $refresh)&client_id=$(UrlEnc $client)&scope=$(UrlEnc $scope)"
+    # HttpWebRequest (nao Invoke-WebRequest): o IWR 5.1 consome o corpo da resposta
+    # antes do catch, deixando o erro vazio. Aqui capturamos status + corpo de
+    # verdade (ex.: AADSTS70000 = grant expirado, usuario precisa entrar de novo).
+    # Tudo dentro do try: falha de rede no GetRequestStream nao pode derrubar o
+    # script inteiro ($ErrorActionPreference=Stop).
     try {
-        $resp = Invoke-WebRequest -Uri $OWA_TOKEN_URL -Method Post -Body $body `
-            -Headers @{ "Origin" = $OWA_ORIGIN } -ContentType "application/x-www-form-urlencoded" -UseBasicParsing
-        $j = $resp.Content | ConvertFrom-Json
+        $req = [System.Net.HttpWebRequest]::Create($OWA_TOKEN_URL)
+        $req.Method = "POST"
+        $req.ContentType = "application/x-www-form-urlencoded"
+        $req.Headers.Add("Origin", $OWA_ORIGIN)
+        $req.Timeout = 30000
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        $rs = $req.GetRequestStream()
+        $rs.Write($bytes, 0, $bytes.Length)
+        $rs.Close()
+        $resp = $req.GetResponse()
+        $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+        $content = $sr.ReadToEnd()
+        $resp.Close()
+        $j = $content | ConvertFrom-Json
         return $j.access_token
+    } catch [System.Net.WebException] {
+        $code = 0; $errBody = ""
+        $hr = $_.Exception.Response
+        if ($hr) {
+            $code = [int]$hr.StatusCode
+            try { $sr = New-Object System.IO.StreamReader($hr.GetResponseStream()); $errBody = $sr.ReadToEnd(); $hr.Close() } catch {}
+        }
+        $script:LastExchangeError = "HTTP $code | $errBody"
+        return $null
     } catch {
         $script:LastExchangeError = $_.Exception.Message
-        if ($_.Exception.Response) {
-            try {
-                $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-                $script:LastExchangeError = $script:LastExchangeError + " | " + $sr.ReadToEnd()
-            } catch {}
-        }
         return $null
     }
 }
