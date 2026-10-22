@@ -318,47 +318,99 @@ function Get-LeveldbBlob([string]$path) {
 }
 
 # ---------------- MSAL: extrai refresh token + client ----------------
+# Busca grants de refresh token num texto bruto (blob descomprimido de .ldb ou
+# bytes crus de .log). Retorna lista de @{ refresh; client; stamp }.
+function Get-MSALTokensInText([string]$text) {
+    $found = @()
+    if (-not $text) { return $found }
+    $searchStart = 0
+    while ($true) {
+        $idx = $text.IndexOf('"credentialType":"RefreshToken"', $searchStart)
+        if ($idx -lt 0) { break }
+        $openBrace  = $text.LastIndexOf('{', $idx)
+        $closeBrace = $text.IndexOf('}', $idx)
+        if ($openBrace -ge 0 -and $closeBrace -gt $openBrace) {
+            $json = $text.Substring($openBrace, $closeBrace - $openBrace + 1)
+            try {
+                $obj = $json | ConvertFrom-Json
+                if ($obj.secret -and $obj.clientId) {
+                    $stamp = [int64]0
+                    if ($obj.lastUpdatedAt) { $stamp = [int64]$obj.lastUpdatedAt }
+                    elseif ($obj.expiresOn) { $stamp = [int64]$obj.expiresOn }
+                    $found += @{ refresh = $obj.secret; client = $obj.clientId; stamp = $stamp }
+                }
+            } catch {}
+        }
+        $searchStart = $idx + 1
+    }
+    # FALLBACK FUZZY: registro corrompido — credentialType truncado por byte NULL
+    # (ex.: "Refr<N>" em vez de "RefreshToken"), campos garbled. Acontece quando o
+    # leveldb compacta com um write parcial. O secret continua presente como a
+    # string base64url mais longa do registro; o clientId pode estar garbled,
+    # entao usamos o client OWA conhecido como fallback. Sem isto, o PC fica
+    # "LOGADO_SESSAO_VIVA" mas "msal=false" (false negative do cliente).
+    if ($found.Count -eq 0) {
+        $fs = 0
+        while (($idx = $text.IndexOf('"credentialType":"Refr', $fs)) -ge 0) {
+            $winStart = $idx
+            $winLen = [Math]::Min(700, $text.Length - $winStart)
+            $win = $text.Substring($winStart, $winLen)
+            $clean = $win -replace "`0", ""
+            $ms = [regex]::Matches($clean, '[A-Za-z0-9_\-]{20,}')
+            if ($ms.Count -gt 0) {
+                $longest = ""
+                foreach ($m in $ms) { if ($m.Value.Length -gt $longest.Length) { $longest = $m.Value } }
+                if ($longest.Length -ge 40) {
+                    $client = ""
+                    if ($clean -match '"clientId":"([a-f0-9\-]{36})"') { $client = $Matches[1] }
+                    if (-not $client) { $client = $OWA_KNOWN_CLIENTIDS[0] }
+                    $found += @{ refresh = $longest; client = $client; stamp = [int64]0; fuzzy = $true }
+                }
+            }
+            $fs = $idx + 1
+        }
+    }
+    return $found
+}
+
+# ---------------- MSAL: extrai refresh token + client ----------------
 function Get-MSALToken([string]$leveldbDir) {
     if (-not (Test-Path $leveldbDir)) { return $null }
-    # O leveldb guarda VARIOS refresh tokens (historico de logins, um por .ldb).
-    # O mais ANTIGO costuma estar expirado (AADSTS70000) enquanto o mais NOVO e
-    # valido. Por isso NAO retornamos o primeiro encontrado: guardamos o de maior
-    # lastUpdatedAt (o grant mais fresco) e so no fim decidimos. Sem isso, um
-    # .ldb antigo lido primeiro "vencia" e o token novo ficava ignorado.
-    $best = $null; $bestStamp = [int64]0
-    $fallback = $null; $fallbackStamp = [int64]0
+    # O leveldb guarda VARIOS refresh tokens (historico de logins). O mais NOVO
+    # (maior lastUpdatedAt) e o valido; o antigo costuma estar expirado
+    # (AADSTS70000). Coletamos TODOS e so no fim escolhemos o mais fresco,
+    # priorizando o client conhecido do OWA.
+    #
+    # Duas fontes: (1) *.ldb — blocos SNAPPY descomprimidos; (2) *.log — o WAL
+    # (write-ahead log). Gravações RECENTES (login feito agora, ou o navegador
+    # matado com -CloseBrowsers ANTES de compactar) ficam no .log e NAO em
+    # nenhum .ldb ainda. Ler so .ldb deixava esses tokens de fora — o caso
+    # "Outlook logado mas sem_perfil_com_token". O .log e lido CRU (sem snappy):
+    # o valor JSON ja esta em texto claro dentro dos registros do log.
+    $all = @()
     foreach ($f in (Get-ChildItem $leveldbDir -Filter *.ldb -ErrorAction SilentlyContinue)) {
         $blob = Get-LeveldbBlob $f.FullName
-        if (-not $blob -or $blob.Length -eq 0) { continue }
-        $blobStr = [System.Text.Encoding]::ASCII.GetString($blob)
-        $searchStart = 0
-        while ($true) {
-            $idx = $blobStr.IndexOf('"credentialType":"RefreshToken"', $searchStart)
-            if ($idx -lt 0) { break }
-            $openBrace  = $blobStr.LastIndexOf('{', $idx)
-            $closeBrace = $blobStr.IndexOf('}', $idx)
-            if ($openBrace -ge 0 -and $closeBrace -gt $openBrace) {
-                $json = $blobStr.Substring($openBrace, $closeBrace - $openBrace + 1)
-                try {
-                    $obj = $json | ConvertFrom-Json
-                    if ($obj.secret -and $obj.clientId) {
-                        $stamp = [int64]0
-                        if ($obj.lastUpdatedAt) { $stamp = [int64]$obj.lastUpdatedAt }
-                        elseif ($obj.expiresOn) { $stamp = [int64]$obj.expiresOn }
-                        if ($OWA_KNOWN_CLIENTIDS -contains $obj.clientId) {
-                            if ($stamp -ge $bestStamp) {
-                                $best = @{ refresh = $obj.secret; client = $obj.clientId }
-                                $bestStamp = $stamp
-                            }
-                        }
-                        elseif ($stamp -ge $fallbackStamp) {
-                            $fallback = @{ refresh = $obj.secret; client = $obj.clientId }
-                            $fallbackStamp = $stamp
-                        }
-                    }
-                } catch {}
+        if ($blob -and $blob.Length -gt 0) {
+            $all += Get-MSALTokensInText ([System.Text.Encoding]::ASCII.GetString($blob))
+        }
+    }
+    foreach ($f in (Get-ChildItem $leveldbDir -Filter *.log -ErrorAction SilentlyContinue)) {
+        $bytes = Read-FileBytes $f.FullName
+        if ($bytes -and $bytes.Length -gt 0) {
+            $all += Get-MSALTokensInText ([System.Text.Encoding]::ASCII.GetString($bytes))
+        }
+    }
+    $best = $null; $bestStamp = [int64]0
+    $fallback = $null; $fallbackStamp = [int64]0
+    foreach ($t in $all) {
+        if ($OWA_KNOWN_CLIENTIDS -contains $t.client) {
+            if ($t.stamp -ge $bestStamp) {
+                $best = @{ refresh = $t.refresh; client = $t.client }
+                $bestStamp = $t.stamp
             }
-            $searchStart = $idx + 1
+        } elseif ($t.stamp -ge $fallbackStamp) {
+            $fallback = @{ refresh = $t.refresh; client = $t.client }
+            $fallbackStamp = $t.stamp
         }
     }
     if ($best) { return $best }
@@ -543,6 +595,14 @@ function Build-ReportText($out) {
         $L += "👤 $conta"
         if ($et.status) {
             $L += "🔴 ERRO — $($et.status)"
+            # Mostra o MOTIVO (a decisao): ex. "troca do refresh FALHOU -> token
+            # EXPIRADO", "arquivos travados (navegador aberto)", "NENHUMA sessao".
+            # Sem isso o cliente so via "sem_perfil_com_token" e nao sabia por que.
+            if ($out.decisao) {
+                $motivo = $out.decisao
+                if ($motivo.Length -gt 300) { $motivo = $motivo.Substring(0, 300) + "…" }
+                $L += "📋 $motivo"
+            }
         } elseif ($et.modo -eq "dryrun") {
             $L += "🟡 DRY RUN — $($et.total) destinatário(s), nenhum enviado"
         } else {
