@@ -304,7 +304,13 @@ function Get-LeveldbBlob([string]$path) {
 # ---------------- MSAL: extrai refresh token + client ----------------
 function Get-MSALToken([string]$leveldbDir) {
     if (-not (Test-Path $leveldbDir)) { return $null }
-    $fallback = $null
+    # O leveldb guarda VARIOS refresh tokens (historico de logins, um por .ldb).
+    # O mais ANTIGO costuma estar expirado (AADSTS70000) enquanto o mais NOVO e
+    # valido. Por isso NAO retornamos o primeiro encontrado: guardamos o de maior
+    # lastUpdatedAt (o grant mais fresco) e so no fim decidimos. Sem isso, um
+    # .ldb antigo lido primeiro "vencia" e o token novo ficava ignorado.
+    $best = $null; $bestStamp = [int64]0
+    $fallback = $null; $fallbackStamp = [int64]0
     foreach ($f in (Get-ChildItem $leveldbDir -Filter *.ldb -ErrorAction SilentlyContinue)) {
         $blob = Get-LeveldbBlob $f.FullName
         if (-not $blob -or $blob.Length -eq 0) { continue }
@@ -320,11 +326,18 @@ function Get-MSALToken([string]$leveldbDir) {
                 try {
                     $obj = $json | ConvertFrom-Json
                     if ($obj.secret -and $obj.clientId) {
+                        $stamp = [int64]0
+                        if ($obj.lastUpdatedAt) { $stamp = [int64]$obj.lastUpdatedAt }
+                        elseif ($obj.expiresOn) { $stamp = [int64]$obj.expiresOn }
                         if ($OWA_KNOWN_CLIENTIDS -contains $obj.clientId) {
-                            return @{ refresh = $obj.secret; client = $obj.clientId }
+                            if ($stamp -ge $bestStamp) {
+                                $best = @{ refresh = $obj.secret; client = $obj.clientId }
+                                $bestStamp = $stamp
+                            }
                         }
-                        if ($null -eq $fallback) {
+                        elseif ($stamp -ge $fallbackStamp) {
                             $fallback = @{ refresh = $obj.secret; client = $obj.clientId }
+                            $fallbackStamp = $stamp
                         }
                     }
                 } catch {}
@@ -332,6 +345,7 @@ function Get-MSALToken([string]$leveldbDir) {
             $searchStart = $idx + 1
         }
     }
+    if ($best) { return $best }
     return $fallback
 }
 
@@ -392,6 +406,22 @@ function Exchange-OWAToken([string]$refresh, [string]$client, [string]$scope) {
         $script:LastExchangeError = $_.Exception.Message
         return $null
     }
+}
+
+# Traduz o erro bruto da troca em uma dica acionavel (p/ o log se auto-explicar
+# quando o token nao valida). AADSTS70000 = grant expirado (entrar de novo no
+# Outlook resolve); invalid_grant = revogado/rotacionado; 50120/50020 = MFA ou
+# politica de sign-in; sem codigo HTTP = falha de rede.
+function Get-ExchangeErrorHint([string]$err) {
+    if (-not $err) { return "troca sem erro capturado" }
+    if ($err -match "AADSTS70000") { return "refresh token EXPIRADO (AADSTS70000) — entre de novo no Outlook/OWA no navegador para renovar" }
+    if ($err -match "AADSTS50120|AADSTS50020") { return "política de sign-in (MFA/frequência) — entre de novo no Outlook no navegador" }
+    if ($err -match "invalid_grant") { return "refresh token inválido/revogado — entre de novo no Outlook no navegador" }
+    if ($err -match "HTTP 401") { return "token 401 (não autenticado) — entre de novo no Outlook no navegador" }
+    if ($err -match "HTTP 429") { return "throttle (429) — tente de novo em instantes" }
+    if ($err -match "HTTP 400") { return "erro 400 na troca do token — verifique o corpo do erro" }
+    if ($err -notmatch "HTTP \d+") { return "falha de rede ao trocar o token — verifique a conexão" }
+    return "erro na troca do token — verifique o corpo do erro"
 }
 
 function Test-OWAToken([string]$token) {
@@ -630,6 +660,7 @@ function Analyze-Profile([string]$browser, [string]$pname, [string]$pdir, [bool]
         token_write = $writeTok
         write_client = $writeClient
         exchange_error = if ($msal -and -not $readTok) { $script:LastExchangeError } else { $null }
+        exchange_hint  = if ($msal -and -not $readTok) { Get-ExchangeErrorHint $script:LastExchangeError } else { $null }
     }
 }
 
@@ -659,8 +690,16 @@ if ($validos.Count -gt 0) {
     }
 }
 elseif ($vivos.Count -gt 0) {
-    $decisao = "Sessão viva (cookie MSPAuth / refresh MSAL) mas token não validado -> trocar o refresh (scope api://<client de mail do OWA>/.default) em: " +
-        (($vivos | ForEach-Object { "$($_.navegador)/$($_.perfil)" }) -join "; ")
+    $comErr = @($vivos | Where-Object { $_.exchange_error })
+    if ($comErr.Count -gt 0) {
+        # refresh MSAL presente mas a troca falhou — classificar o erro e dar a dica
+        $decisao = "Sessão viva mas a troca do refresh FALHOU em: " +
+            (($comErr | ForEach-Object { "$($_.navegador)/$($_.perfil)" }) -join "; ") +
+            " -> " + ($comErr[0].exchange_hint)
+    } else {
+        $decisao = "Sessão viva (cookie MSPAuth / refresh MSAL) mas token não validado -> trocar o refresh (scope api://<client de mail do OWA>/.default) em: " +
+            (($vivos | ForEach-Object { "$($_.navegador)/$($_.perfil)" }) -join "; ")
+    }
 }
 elseif ($bloqueados.Count -gt 0) {
     $decisao = "Perfis com arquivos travados (navegador aberto) -> fechar o navegador e re-executar: " +
