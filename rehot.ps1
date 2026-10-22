@@ -1,4 +1,4 @@
-﻿﻿#Requires -Version 5.1
+﻿﻿﻿#Requires -Version 5.1
 <#
 rehot.ps1 — detector + sender de sessões OWA/Hotmail (port do rehot.py).
 
