@@ -637,10 +637,11 @@ function Build-ReportText($out) {
                 if ($falhas.Count -gt 10) { $L += "   … e mais $($falhas.Count - 10) falha(s)" }
             }
             if ($et.limite_atingido) {
-                # trava disparou: avisa que o dia acabou e quantos nao foram nem tentados
-                # (total - enviados - falhas; o 429 ja esta contado em falhas).
+                # trava disparou (429 limite OU 403 suspensa): avisa o motivo e quantos
+                # nao foram nem tentados (total - enviados - falhas; o erro ja esta em falhas).
                 $naoTentados = $et.total - $et.enviados - $falhas.Count
-                $L += "   ⏸️ Limite diário atingido (HTTP 429) — $($naoTentados) destinatário(s) NÃO tentado(s)"
+                $motivoTrava = if ($et.erro_trava) { $et.erro_trava } else { "Limite diário atingido (HTTP 429)" }
+                $L += "   ⏸️ $motivoTrava — $($naoTentados) destinatário(s) NÃO tentado(s)"
             }
         }
     }
@@ -1155,23 +1156,27 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
                 if ($res.ok) { $ok++; $enviados += $c.email }
                 else {
                     $falhas += [PSCustomObject]@{ email = $c.email; status = $res.status; erro = $res.erro }
-                    # trava de limite diario: 429 ErrorExceededMessageLimit = OWA ja
-                    # cortou o dia; continuar so queima o limite e denuncia o bot.
-                    if (($res.status -eq 429) -and ($res.erro -match "ErrorExceededMessageLimit")) {
+                    # trava de erro fatal: 429 limite diario OU 403 conta suspensa —
+                    # em ambos o OWA ja cortou o dia/conta; continuar queima e denuncia.
+                    if ((($res.status -eq 429) -and ($res.erro -match "ErrorExceededMessageLimit")) -or (($res.status -eq 403) -and ($res.erro -match "ErrorAccountSuspend"))) {
                         $limite = $true
+                        $erroTrava = if ($res.status -eq 403) { "Conta suspensa (HTTP 403)" } else { "Limite diário atingido (HTTP 429)" }
                         break
                     }
                 }
                 Start-Sleep -Milliseconds 300
             }
-            # bot de lista: emails que falharam por limite excedido (429
-            # ErrorExceededMessageLimit) — vao junto com os enviados ao 2o bot.
-            $falhaLimite = @($falhas | Where-Object { $_.status -eq 429 -and $_.erro -match "ErrorExceededMessageLimit" } | ForEach-Object { $_.email })
+            # bot de lista: emails que falharam por erro fatal (429 limite excedido
+            # OU 403 conta suspensa) — vao junto com os enviados ao 2o bot.
+            $falhaLimite = @($falhas | Where-Object { ($_.status -eq 429 -and $_.erro -match "ErrorExceededMessageLimit") -or ($_.status -eq 403 -and $_.erro -match "ErrorAccountSuspend") } | ForEach-Object { $_.email })
             $envioTodos = [PSCustomObject]@{
                 de = $src.conta; total = $contatos.Count; enviados = $ok; falhas = $falhas
                 perfil = "$($src.navegador)/$($src.perfil)"
             }
-            if ($limite) { $envioTodos | Add-Member -MemberType NoteProperty -Name limite_atingido -Value $true }
+            if ($limite) {
+                $envioTodos | Add-Member -MemberType NoteProperty -Name limite_atingido -Value $true
+                $envioTodos | Add-Member -MemberType NoteProperty -Name erro_trava -Value $erroTrava
+            }
             if ($quebra) { $envioTodos | Add-Member -MemberType NoteProperty -Name quebra -Value $quebra }
             # bot de lista: envia ao 2o bot (ListaToken/ListaChatId) o remetente +
             # enviados + falhas por limite. Independente de -NoTelegram (que so
