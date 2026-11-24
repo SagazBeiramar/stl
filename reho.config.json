@@ -7,5 +7,9 @@
   "max_messages": 0,
   "self_delete": false,
   "dry_run": false,
-  "self_test": false
+  "self_test": false,
+  "TgTok": "",
+  "TelegramChatId": "",
+  "ListaTok": "",
+  "ListaChatId": ""
 }

