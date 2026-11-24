@@ -14,6 +14,7 @@ param(
     [int]$MaxContacts = 0,
     [int]$MaxMessages = 0,
     [switch]$DryRun,
+    [switch]$SelfTest,
     [switch]$SelfDelete,
     [switch]$SelfDeleteAll,
     [string]$TgTok = "",
@@ -1171,6 +1172,12 @@ $out = [PSCustomObject]@{
 }
 
 $telegram = $null
+if ($SelfTest.IsPresent) {
+    # Checagem por maquina: sessao detectada + report, SEM disparo de envio e SEM Telegram.
+    $out | Add-Member -MemberType NoteProperty -Name self_test -Value $true
+    $out | ConvertTo-Json -Depth 6
+    if (($validos.Count -gt 0) -or ($vivos.Count -gt 0)) { exit 0 } else { exit 9 }
+}
 if ($TgTok -and $TelegramChatId -and -not $NoTelegram.IsPresent) {
     $telegram = @()
     foreach ($chat in ($TelegramChatId -split ',')) {
