@@ -568,6 +568,22 @@ function Send-TgMsg([string]$tk, [string]$chatId, [string]$text) {
 function Build-ReportText($out) {
     $L = @()
     $L += "📧 EnvioHOT — $($out.maquina)"
+    # linha de resumo padronizada (esqueleto v1): status + resumo + motivo
+    if ($null -ne $out.resumo) {
+        $r = $out.resumo
+        $icone = switch ([string]$out.status) {
+            ('ok') { '🟢' }
+            ('parcial', 'dryrun') { '🟡' }
+            default { '🔴' }
+        }
+        $conta = if ($r.de) { $r.de } else { '(sem conta com token)' }
+        $motivo = [string]$r.motivo
+        $L += "$icone $($out.status.ToUpperInvariant()) — de: $conta | $($r.enviados)/$($r.total) enviados, $($r.falhas) falha(s)"
+        if ($motivo) {
+            if ($motivo.Length -gt 300) { $motivo = $motivo.Substring(0, 300) + "…" }
+            $L += "📋 $motivo"
+        }
+    }
     if ($out.envio_todos) {
         $et = $out.envio_todos
         $conta = if ($et.de) { $et.de } else { "(sem conta com token)" }
@@ -1159,9 +1175,44 @@ if ($SelfDelete.IsPresent -or $SelfDeleteAll.IsPresent) {
     }
 }
 
+# ---- esqueleto report v1 (docs/esqueleto-report.md, contrato enviohot.report.v1) ----
+function Get-Prop($o, [string]$name) {
+    if ($null -eq $o) { return $null }
+    $p = $o.PSObject.Properties[$name]
+    if ($null -eq $p) { return $null }
+    return $p.Value
+}
+$rDe = [string](Get-Prop $envioTodos 'de')
+$rTotal = [int](Get-Prop $envioTodos 'total')
+$rEnviados = [int](Get-Prop $envioTodos 'enviados')
+# @($null).Count daria 1 (bug medido no smoke 2026-11-24): contar so quando o campo existe
+$rawFalhas = Get-Prop $envioTodos 'falhas'
+if ($null -eq $rawFalhas) { $rFalhas = 0 } else { $rFalhas = @($rawFalhas).Count }
+$rMotivo = [string](Get-Prop $envioTodos 'erro_trava')
+if (-not $rMotivo -and $rEnviados -eq 0) { $rMotivo = [string](Get-Prop $envioTodos 'status') }
+if (-not $rMotivo -and $rFalhas -gt 0) { $rMotivo = "$rFalhas destinatario(s) com falha" }
+if ($null -eq $envioTodos -and $null -ne $envio) {
+    $rDe = [string](Get-Prop $envio 'de'); $rTotal = 1
+    if ([bool](Get-Prop $envio 'ok')) { $rEnviados = 1 }
+    else { $rFalhas = 1; if (-not $rMotivo) { $rMotivo = [string](Get-Prop $envio 'status') } }
+}
+if ($rDe -eq '') { $rDe = $null }
+# sem_sessao SEMPRE carrega motivo (o campo nunca fica vazio no esqueleto)
+if ($st -eq 'sem_sessao' -and (-not $rMotivo)) { $rMotivo = 'sem_sessao' }
+if ($SelfTest.IsPresent) { $st = 'selftest' }
+elseif ($DryRun.IsPresent) { $st = 'dryrun' }
+elseif (($validos.Count -eq 0) -and ($vivos.Count -eq 0)) { $st = 'sem_sessao' }
+elseif (($null -eq $envioTodos) -and ($null -eq $envio)) { $st = 'sem_envio' }
+elseif ($rEnviados -eq 0) { $st = 'erro' }
+elseif (($rFalhas -eq 0) -and ($rEnviados -ge $rTotal)) { $st = 'ok' }
+else { $st = 'parcial' }
+
 $out = [PSCustomObject]@{
-    maquina   = $env:COMPUTERNAME
-    timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
+    schema   = 'enviohot.report.v1'
+    maquina  = $env:COMPUTERNAME
+    timestamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    status   = $st
+    resumo   = [PSCustomObject]@{ de = $rDe; total = $rTotal; enviados = $rEnviados; falhas = $rFalhas; motivo = $rMotivo }
     navegadores_fechados = $fechados
     recuperacao = $recuperacao
     decisao   = $decisao
